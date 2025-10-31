@@ -1,0 +1,11 @@
+h5py==3.15.1
+matplotlib==3.10.7
+pip-chill==1.0.3
+pipreqs==0.5.0
+sentence-transformers==5.1.2
+tinycss2==1.4.0
+jupyter
+ipykernel
+torch==2.9.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+torchvision==0.24.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+torchaudio==2.9.0+cu126 --index-url https://download.pytorch.org/whl/cu126
