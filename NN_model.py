@@ -99,12 +99,12 @@ class BehaviorPredictor(nn.Module):
         rnn_in = self.cnn_feat_dim + self.stim_fusion_dim
         if rnn_type.lower() == "lstm":
             self.rnn = nn.LSTM(rnn_in, rnn_hidden_size, rnn_layers,
-                               batch_first=True, dropout=rnn_dropout)
+                               batch_first=True, dropout=rnn_dropout, bidirectional=True)
         else:
             self.rnn = nn.GRU(rnn_in, rnn_hidden_size, rnn_layers,
-                              batch_first=True, dropout=rnn_dropout)
-        self.layer_norm = nn.LayerNorm(rnn_hidden_size)
-        self.classifier = nn.Linear(rnn_hidden_size, num_labels)
+                              batch_first=True, dropout=rnn_dropout, bidirectional=True)
+        self.layer_norm = nn.LayerNorm(rnn_hidden_size * 2)
+        self.classifier = nn.Linear(rnn_hidden_size * 2, num_labels)
 
         self.imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         self.imagenet_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
