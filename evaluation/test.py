@@ -26,7 +26,8 @@ def test_model(
     text_mode: str = "precomputed",
     text_in_dim: int | None = None,
     text_model_name: str | None = None,
-    use_stim_window: bool = False
+    use_stim_window: bool = False,
+    normalization_stats_path: str | None = None
 ):
     """
     Evaluate frame-level metrics AND timing-agnostic presence metrics.
@@ -56,14 +57,22 @@ def test_model(
         presence_threshold: Threshold for presence detection (probs mode)
         use_text_encoder: Whether model uses text encoder
         text_mode: Text encoder mode
-        text_in_dim: Text input dimension
+        text_in_dim: Text input dimension (for precomputed mode)
         text_model_name: Sentence transformer model name
         use_stim_window: Whether to use stimulus window conditioning
+        normalization_stats_path: Path to JSON file with dataset normalization statistics
         
     Returns:
         per_class_thresholds: Tuned thresholds if tune_per_class=True, else None
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load normalization statistics if provided
+    norm_mean, norm_std = None, None
+    if normalization_stats_path is not None:
+        from data.preprocessing import load_normalization_stats
+        norm_mean, norm_std = load_normalization_stats(normalization_stats_path)
+        print(f"[INFO] Loaded normalization stats from {normalization_stats_path}")
 
     # Load model
     model = BehaviorPredictor(
@@ -72,7 +81,9 @@ def test_model(
         text_mode=text_mode,
         text_in_dim=text_in_dim,
         text_model_name=text_model_name,
-        use_stim_window=use_stim_window
+        use_stim_window=use_stim_window,
+        norm_mean=norm_mean,
+        norm_std=norm_std
     ).to(device)
     state = torch.load(model_path, map_location=device)
     model.load_state_dict(state)

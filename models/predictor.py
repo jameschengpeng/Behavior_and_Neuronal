@@ -17,7 +17,8 @@ class BehaviorPredictor(nn.Module):
                  stim_type_dim=4, stim_loc_dim=2, stim_embed_dim=8,
                  use_text_encoder=False, text_mode="precomputed",
                  text_in_dim=None, text_model_name=None,
-                 global_conditioning=True, use_stim_window=False):
+                 global_conditioning=True, use_stim_window=False,
+                 norm_mean=None, norm_std=None):
         super().__init__()
 
         # -------- EfficientNet-B0 trunk --------
@@ -58,14 +59,19 @@ class BehaviorPredictor(nn.Module):
         self.layer_norm = nn.LayerNorm(rnn_hidden_size * 2)
         self.classifier = nn.Linear(rnn_hidden_size * 2, num_labels)
 
-        self.imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        self.imagenet_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        # Use custom normalization stats if provided, otherwise fall back to ImageNet
+        if norm_mean is not None and norm_std is not None:
+            self.norm_mean = torch.tensor(norm_mean).view(1, 3, 1, 1)
+            self.norm_std  = torch.tensor(norm_std).view(1, 3, 1, 1)
+        else:
+            self.norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+            self.norm_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
     @torch.no_grad()
     def _normalize(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, 3, T, H, W)
-        mean = self.imagenet_mean.to(x.device).type_as(x).view(1, 3, 1, 1, 1)
-        std  = self.imagenet_std.to(x.device).type_as(x).view(1, 3, 1, 1, 1)
+        mean = self.norm_mean.to(x.device).type_as(x).view(1, 3, 1, 1, 1)
+        std  = self.norm_std.to(x.device).type_as(x).view(1, 3, 1, 1, 1)
         return (x - mean) / std
 
     def forward(self, x, stim_type, stim_loc, stim_onsets, stim_offsets, lengths,

@@ -25,7 +25,8 @@ def train_model(train_loader,
                 text_mode: str = "precomputed",
                 text_in_dim: int | None = None,
                 text_model_name: str | None = None,
-                use_stim_window: bool = False):
+                use_stim_window: bool = False,
+                normalization_stats_path: str | None = None):
     """
     Train BehaviorPredictor with masked loss and optional Asymmetric Loss.
     
@@ -48,18 +49,31 @@ def train_model(train_loader,
         text_in_dim: Text input dimension (for precomputed mode)
         text_model_name: Sentence transformer model name
         use_stim_window: Whether to use stimulus window conditioning
+        normalization_stats_path: Path to JSON file with dataset normalization statistics
         
     Returns:
         Trained model
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load normalization statistics if provided
+    norm_mean, norm_std = None, None
+    if normalization_stats_path is not None:
+        from data.preprocessing import load_normalization_stats
+        norm_mean, norm_std = load_normalization_stats(normalization_stats_path)
+        print(f"[INFO] Loaded normalization stats from {normalization_stats_path}")
+        print(f"       Mean: {norm_mean}")
+        print(f"       Std:  {norm_std}")
+    
     model = BehaviorPredictor(
         num_labels=num_labels,
         use_text_encoder=use_text_encoder,
         text_mode=text_mode,
         text_in_dim=text_in_dim,
         text_model_name=text_model_name,
-        use_stim_window=use_stim_window
+        use_stim_window=use_stim_window,
+        norm_mean=norm_mean,
+        norm_std=norm_std
     ).to(device)
 
     # --- Compute class stats from train data (masked to valid timesteps) ---
