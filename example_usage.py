@@ -135,7 +135,7 @@ print("Step 5: Visualizing Results")
 print("=" * 60)
 
 from evaluation import plot_ethogram_pair
-from NN_model import BehaviorPredictor
+from models import BehaviorPredictor
 import torch.nn as nn
 
 # Load model for inference

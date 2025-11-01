@@ -1,3 +1,9 @@
 """Neural network models."""
 
-__all__ = []
+from .predictor import BehaviorPredictor
+from .encoders import TextEncoder
+
+__all__ = [
+    'BehaviorPredictor',
+    'TextEncoder',
+]

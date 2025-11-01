@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from NN_model import BehaviorPredictor
+from models import BehaviorPredictor
 from .postprocessing import hysteresis_decode
 from .metrics import tune_per_class_thresholds as _tune_per_class_thresholds
 

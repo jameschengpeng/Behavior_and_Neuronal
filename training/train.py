@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from NN_model import BehaviorPredictor
+from models import BehaviorPredictor
 from .losses import asymmetric_loss_with_mask
 from .utils import compute_pos_weight_and_prior, init_classifier_bias_from_prior
 
