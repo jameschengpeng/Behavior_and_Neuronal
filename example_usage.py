@@ -20,13 +20,16 @@ print("Step 1: Computing Dataset Statistics")
 print("=" * 60)
 
 from data.preprocessing import compute_dataset_statistics, save_normalization_stats
+from utils.paths import get_data_path
 
 # Compute statistics from your data
-H5_PATH = "path/to/your/data.h5"  # UPDATE THIS PATH
+# Example: Use get_data_path("D21/input_output_data_downsample_444.h5")
+# This will automatically use the correct path for Windows or Linux
+H5_PATH = get_data_path("D21/input_output_data_downsample_444.h5")  # UPDATE the relative path as needed
 mean, std = compute_dataset_statistics(H5_PATH, max_videos=10, frames_per_video=100)
 
-# Save for future use
-save_normalization_stats(mean, std, 'normalization_stats.json')
+# Save for future use (to data directory, same as H5 file)
+save_normalization_stats(mean, std, get_data_path("D21/normalization_stats.json"))
 
 # ============================================================================
 # 2. LOAD DATA

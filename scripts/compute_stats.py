@@ -7,12 +7,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from data.preprocessing import compute_dataset_statistics, save_normalization_stats
+from utils.paths import get_data_path
 
 
 def main():
     # Configuration
-    H5_PATH = "path/to/your/data.h5"  # UPDATE THIS
-    OUTPUT_PATH = "normalization_stats.json"
+    # Example: Use get_data_path("D21/input_output_data_downsample_444.h5")
+    # This will automatically use the correct path for Windows or Linux
+    H5_PATH = get_data_path("D21/input_output_data_downsample_444.h5")  # UPDATE the relative path as needed
+    OUTPUT_PATH = get_data_path("D21/normalization_stats.json")  # Save to data directory
     
     MAX_VIDEOS = 10           # Sample from 10 videos
     FRAMES_PER_VIDEO = 100    # 100 frames per video
