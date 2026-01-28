@@ -41,6 +41,7 @@ new_height = floor(height / spa_down_factor);
 new_width  = floor(width  / spa_down_factor);
 new_frames = sum(floor(video_lengths ./ temp_down_factor)); % addition of all down-sampled video lengths. NOT total frames divided by down-sample factor
 
+
 dF1_downsampled = zeros(new_height, new_width, new_frames);
 datOrg1_downsampled = zeros(new_height, new_width, new_frames);
 ethogram_mat_downsampled = zeros(new_frames, size(concat_ethogram_mat, 2));
@@ -87,6 +88,12 @@ clear video_dF1 video_org1 video_ethogram video_dF1_spa_down video_org1_spa_down
 % apply mild smoothing spatially
 dF1_downsampled_smoothed = imgaussfilt3(dF1_downsampled, [2, 2, 1e-6]);
 datOrg1_downsampled_smoothed = imgaussfilt3(datOrg1_downsampled, [2, 2, 1e-6]);
+
+% save preprocessed dF and datOrg
+% save("D:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat", "dF1_downsampled_smoothed", "datOrg1_downsampled_smoothed", ...
+%     "ethogram_mat_downsampled", "subset_cutting_points", "-v7.3");
+
+
 % -------------------------------------------------------------------------
 % Reshape: each row = one frame, each column = one pixel
 X_dF = reshape(dF1_downsampled_smoothed, [], new_frames);
@@ -105,7 +112,7 @@ new_subset_cutting_points = [0; new_subset_cutting_points]; % include 0 at begin
 
 n_video_select = 10;
 start_video = 1;
-select_start = new_subset_cutting_points(start_video) + 1;
+select_start = new_subset_cutting_points(start_video); % not including starting index of the video, so it can be 0
 select_end = new_subset_cutting_points(n_video_select+1);
 voxel_baseline = zeros(size(datOrg1_downsampled_smoothed(:,:,(select_start+1):select_end)));
 for ii = 1:n_video_select
@@ -121,14 +128,13 @@ X_dFF = X_dFF';
 if min(X_dFF(:)) < 0
     X_dFF = X_dFF - min(X_dFF(:));  
 end
-
-%% vanilla NMF from matlab's built-in function
+%% 
 k_nmf_comp = 8; % number of components in NMF
 unmasked_indices = find(mask_downsampled);
 unmasked_X_dFF = X_dFF'; % pixels * time
 unmasked_X_dFF = unmasked_X_dFF(unmasked_indices, :);
 
-% Set options for NNMF
+%% vanilla NMF from matlab's built-in function. Set options for NNMF
 opt = statset('nnmf');
 opt.MaxIter = 1000;
 opt.Display = 'final';
@@ -151,27 +157,79 @@ spatial_components = reshape(W_full, [new_height, new_width, k_nmf_comp]);
 
 % Temporal traces (k_nmf_comp × T)
 temporal_traces = H;
+
+norm(W * H - unmasked_X_dFF) / norm(unmasked_X_dFF)
 %%
 ethogram_mat = ethogram_mat_downsampled((select_start+1):select_end, :);
 plotNMF_withBehaviorOnsets(H, ethogram_mat', 40/temp_down_factor, W_full, [new_height, new_width])
 
 %% constrained NMF
 opts = struct();
-opts.lambdaA_L1     = 3e-4;
-opts.lambdaA_lap    = 1;
-opts.lambdaA_excl   = 1e-5;
-opts.lambdaC_smooth = 1e-1;
 
-opts.maxIter = 300;
-opts.tol = 1e-5;
+% =====================
+% Iteration / stopping
+% =====================
+opts.maxIter   = 200;
+opts.minIter   = 60;
+opts.tol       = 1e-5;
 
-% step sizes often need tuning
-opts.etaA = 1e-3;
-opts.etaC = 5e-3;
+% =====================
+% Spatial penalties
+% =====================
+opts.lambdaA_L1   = 1e-6;     % VERY weak sparsity (astrocytes are diffuse)
+opts.lambdaA_lap  = 5e-4;     % smooth contiguous regions
+opts.lambdaA_excl = 0;        % OFF initially (overlap is allowed)
+
+% =====================
+% Temporal penalty
+% =====================
+opts.lambdaC_smooth = 1e-3;   % smooth calcium dynamics
+
+% =====================
+% Step sizes / solver
+% =====================
+opts.use_adaptive_steps = true;
+opts.innerA = 1;
+opts.innerC = 1;
+
+% =====================
+% Normalization
+% =====================
+opts.doNormalize     = true;
+opts.normalizeEvery = 10;     % NOT every iteration (important)
+
+% =====================
+% Background modeling
+% =====================
+opts.use_background = true;   % CRITICAL for clean A maps
+opts.bg_rank = 2; % allow background to be of multi-rank
+% =====================
+% Nonnegativity handling
+% =====================
+opts.nonneg_mode = "none";    % do NOT shift again inside CNMF
+
+% =====================
+% Laplacian neighborhood
+% =====================
+opts.neighborhood = 4;        % 4-neighbor is safer for thin processes
+
+% =====================
+% Safeguards
+% =====================
+opts.backtracking = true;
+opts.maxBacktrack = 15;
+
+% =====================
+% Misc
+% =====================
+opts.seed        = 0;
+opts.verbose     = true;
+opts.printEvery = 10;
 
 
 [A, C, info] = custom_cnmf(X_dFF', new_height, new_width, k_nmf_comp, mask_downsampled, opts);
 
+norm(A(unmasked_indices, :) * C + info.b(unmasked_indices) * info.f - unmasked_X_dFF) / norm(unmasked_X_dFF)
 %% Visualize component k footprint
 ethogram_mat = ethogram_mat_downsampled((select_start+1):select_end, :);
 plotNMF_withBehaviorOnsets(C, ethogram_mat', 40/temp_down_factor, A, [new_height, new_width])
@@ -257,7 +315,7 @@ spatial_components_train = reshape(W_full, [new_height, new_width, k_nmf_comp]);
 temporal_traces_train = H_train;  % K x Ttrain
 temporal_traces_test  = H_test;   % K x Ttest
 
-%%
+%% Train test split for constrained NMF
 
 
 % -----------------------
@@ -297,14 +355,14 @@ H_active = P_active;
 W_active = 1;
 mask_all_ones = true(P_active, 1);
 
-[A_train_act, C_train, info_train] = custom_cnmf(X_train, H_active, W_active, K, mask_all_ones, opts);
+[A_train_act, C_train, info_train] = custom_cnmf(X_train, H_active, W_active, k_nmf_comp, mask_all_ones, opts);
 % A_train_act: P_active x K
 % C_train:     K x Ttrain
 
 % -----------------------
 % Test: infer C_test with A_train_act fixed using SAME NNLS as vanilla
 % -----------------------
-C_test = zeros(K, Ttest);
+C_test = zeros(k_nmf_comp, Ttest);
 for tt = 1:Ttest
     C_test(:, tt) = lsqnonneg(A_train_act, X_test(:, tt));
 end
@@ -323,10 +381,10 @@ fprintf('  relRecon_test  = %.6g\n', relRecon_test);
 % Optional: recover full-size A for visualization (masked pixels = 0)
 % -----------------------
 P = size(X_full,1);               % P = new_height*new_width
-A_full = zeros(P, K);
+A_full = zeros(P, k_nmf_comp);
 A_full(unmasked_indices, :) = A_train_act;
 
-A_full_img = reshape(A_full, [new_height, new_width, K]);  % H x W x K
+A_full_img = reshape(A_full, [new_height, new_width, k_nmf_comp]);  % H x W x K
 
 % Training temporal traces:
 C_train_traces = C_train;  % K x Ttrain
