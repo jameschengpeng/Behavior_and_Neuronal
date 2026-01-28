@@ -1,5 +1,5 @@
 %% read all AQuA2 files, concatenate all videos and their dF. It is too slow to write the concatenated video and dF into mat file
-function [concat_dF, concat_datOrg, concat_evt_map, subset_cutting_points, early_reaction_regions] = concat_videos(folder)
+function [concat_dF, concat_datOrg, concat_evt_map, subset_cutting_points, early_reaction_regions] = concat_videos(folder, file_suffix)
 concat_dF = [];
 concat_datOrg = [];
 concat_evt_map = [];
@@ -7,7 +7,7 @@ subset_cutting_points = []; % if you want a subset of data, here are indices on 
 
 for video_idx = 1:32
     indexStr = sprintf('%02d', video_idx);
-    aqua_result_file = strcat("data", indexStr, "_ManualMoCo_cropped_AQuA2.mat");
+    aqua_result_file = strcat("data", indexStr, "_", file_suffix, ".mat");
     aqua_result = load(fullfile(folder, aqua_result_file));
     
     res = aqua_result.res;

@@ -5,7 +5,7 @@ addpath(genpath('C:\Users\james\CBIL\Astrocyte\scalable_calcium_model_prev'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 %%
 % For all recordings
-[dF1, datOrg1, evt_map, subset_cutting_points, early_reaction_regions] = concat_videos("D:\Mouse_behavior_data\D21\AQuA2");
+[dF1, datOrg1, evt_map, subset_cutting_points, early_reaction_regions] = concat_videos("D:\Mouse_behavior_data\D21\AQuA2", "ManualMoco_cropped_AQuA2");
 
 % add 0 to the first element of subset_cutting_points
 subset_cutting_points = [0; subset_cutting_points];
@@ -23,14 +23,6 @@ mask = zeros(size(dF1, 1), size(dF1, 2));
 mask(upper_unmasked) = 1;
 mask(lower_unmasked) = 1;
 
-%% just for inspection on the time lengths of a certain ethogram
-v = concat_ethogram_mat(:,5);
-v = v(:)';
-d = diff([0 v 0]);       % pad with zeros at both ends
-startIdx = find(d == 1);
-endIdx   = find(d == -1) - 1;
-lengths  = endIdx - startIdx + 1
-
 %% Downsampling
 % Downsample in spatial and temporal dimensions
 spa_down_factor = 2;
@@ -45,6 +37,7 @@ new_frames = sum(floor(video_lengths ./ temp_down_factor)); % addition of all do
 dF1_downsampled = zeros(new_height, new_width, new_frames);
 datOrg1_downsampled = zeros(new_height, new_width, new_frames);
 ethogram_mat_downsampled = zeros(new_frames, size(concat_ethogram_mat, 2));
+evt_map_downsampled = zeros(new_height, new_width, new_frames);
 
 % Downsample + spatial smoothing each frame. Do it video by video
 counter = 0; % record the time index AFTER temp down-sample
@@ -56,22 +49,26 @@ for i = 1:numel(video_lengths) % iterate over videos
     video_dF1 = dF1(:, :, start_T:end_T);
     video_org1 = datOrg1(:, :, start_T:end_T);
     video_ethogram = concat_ethogram_mat(start_T:end_T, :);
+    video_evt = evt_map(:, :, start_T:end_T);
     
     % spatially downsample using imresize
     video_dF1_spa_down = imresize(video_dF1, [new_height, new_width], 'bicubic');
     video_org1_spa_down = imresize(video_org1, [new_height, new_width], 'bicubic');
+    video_evt_spa_down = imresize(video_evt, [new_height, new_width], 'nearest');
 
     % temporally downsample by taking average for video and dF1 and also
     % the ethogram. The ethogram becomes a probability
     video_dF1_spa_temp_down = zeros(new_height, new_width, T_down);
     video_org1_spa_temp_down = zeros(new_height, new_width, T_down);
     video_ethogram_temp_down = zeros(T_down, size(concat_ethogram_mat, 2));
+    video_evt_spa_temp_down = zeros(new_height, new_width, T_down);
     for j = 1:T_down
         substart_T = (j-1) * temp_down_factor + 1; % local index in a video BEFORE temp down-sample
         subend_T = j * temp_down_factor; % local index in a video BEFORE temp down-sample
         video_dF1_spa_temp_down(:, :, j) = mean(video_dF1_spa_down(:, :, substart_T:subend_T), 3);
         video_org1_spa_temp_down(:, :, j) = mean(video_org1_spa_down(:, :, substart_T:subend_T), 3);
         video_ethogram_temp_down(j, :) = mean(video_ethogram(substart_T:subend_T, :), 1);
+        video_evt_spa_temp_down(:, :, j) = mean(video_evt_spa_down(:, :, substart_T:subend_T), 3) > 0.5;
     end
     
     new_start_T = counter + 1;
@@ -79,19 +76,32 @@ for i = 1:numel(video_lengths) % iterate over videos
     dF1_downsampled(:, :, new_start_T:new_end_T) = video_dF1_spa_temp_down;
     datOrg1_downsampled(:, :, new_start_T:new_end_T) = video_org1_spa_temp_down;
     ethogram_mat_downsampled(new_start_T:new_end_T, :) = video_ethogram_temp_down; 
+    evt_map_downsampled(:, :, new_start_T:new_end_T) = video_evt_spa_temp_down;
     
     counter = new_end_T;
 end
 % delete the intermediate variables to save space
 clear video_dF1 video_org1 video_ethogram video_dF1_spa_down video_org1_spa_down video_dF1_spa_temp_down video_org1_spa_temp_down video_ethogram_temp_down
+clear video_evt_spa_down video_evt_spa_temp_down evt_map
 
 % apply mild smoothing spatially
 dF1_downsampled_smoothed = imgaussfilt3(dF1_downsampled, [2, 2, 1e-6]);
 datOrg1_downsampled_smoothed = imgaussfilt3(datOrg1_downsampled, [2, 2, 1e-6]);
 
+clear dF1_downsampled datOrg1_downsampled
+
+% correct the subset cutting points after temporal downsampling
+new_subset_cutting_points = cumsum(floor(video_lengths ./ temp_down_factor)); % update the subset cutting points
+new_subset_cutting_points = [0; new_subset_cutting_points]; % include 0 at beginning
+
+% downsample the mask
+mask_downsampled = imresize(mask, [new_height, new_width]);
+mask_downsampled(mask_downsampled < 0.5) = 0;
+mask_downsampled(mask_downsampled >= 0.5) = 1;
+
 % save preprocessed dF and datOrg
-% save("D:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat", "dF1_downsampled_smoothed", "datOrg1_downsampled_smoothed", ...
-%     "ethogram_mat_downsampled", "subset_cutting_points", "-v7.3");
+save("D:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat", "dF1_downsampled_smoothed", "datOrg1_downsampled_smoothed", ...
+    "ethogram_mat_downsampled", "subset_cutting_points", "evt_map_downsampled", "mask_downsampled", "-v7.3");
 
 
 % -------------------------------------------------------------------------
@@ -102,24 +112,17 @@ if min(X_dF(:)) < 0
     X_dF = X_dF - min(X_dF(:));
 end
 
-% downsample the mask
-mask_downsampled = imresize(mask, [new_height, new_width]);
-mask_downsampled(mask_downsampled < 0.5) = 0;
-mask_downsampled(mask_downsampled >= 0.5) = 1;
 %% compute the baseline for dF/F
-new_subset_cutting_points = cumsum(floor(video_lengths ./ temp_down_factor)); % update the subset cutting points
-new_subset_cutting_points = [0; new_subset_cutting_points]; % include 0 at beginning
-
 n_video_select = 10;
-start_video = 1;
-select_start = new_subset_cutting_points(start_video); % not including starting index of the video, so it can be 0
-select_end = new_subset_cutting_points(n_video_select+1);
-voxel_baseline = zeros(size(datOrg1_downsampled_smoothed(:,:,(select_start+1):select_end)));
+start_video = 11;
+select_start = new_subset_cutting_points(start_video); % global, not including starting index of the video, so it can be 0
+select_end = new_subset_cutting_points(start_video + n_video_select); % global
+voxel_baseline = zeros(size(datOrg1_downsampled_smoothed(:,:,(select_start+1):select_end))); % local 
 for ii = 1:n_video_select
-    start_ii = new_subset_cutting_points(ii)+1;
-    end_ii = new_subset_cutting_points(ii+1);
-    single_video_baseline = find_baseline_all_voxel(datOrg1_downsampled_smoothed(:,:,start_ii:end_ii), 40, 8);
-    voxel_baseline(:,:,start_ii:end_ii) = single_video_baseline;
+    start_ii = new_subset_cutting_points(ii+start_video-1)+1; % global
+    end_ii = new_subset_cutting_points(ii+start_video); % global
+    single_video_baseline = find_baseline_all_voxel(datOrg1_downsampled_smoothed(:,:,start_ii:end_ii), 40, 8); % global
+    voxel_baseline(:,:,(start_ii-select_start):(end_ii-select_start)) = single_video_baseline; % local
 end
 
 dFF = (datOrg1_downsampled_smoothed(:,:,(select_start+1):select_end) - voxel_baseline)./voxel_baseline;
@@ -128,6 +131,18 @@ X_dFF = X_dFF';
 if min(X_dFF(:)) < 0
     X_dFF = X_dFF - min(X_dFF(:));  
 end
+%%
+evt_domain_projection = zeros(size(evt_map_downsampled, 1), size(evt_map_downsampled, 2));
+conn = bwconncomp(evt_map_downsampled, 6);
+for ii = 1:conn.NumObjects
+    indices = conn.PixelIdxList{ii};
+    [xx, yy, zz] = ind2sub(size(evt_map_downsampled), indices);
+    xx_select = xx(zz==mode(zz));
+    yy_select = yy(zz==mode(zz));
+    ind_2d = sub2ind([size(evt_map_downsampled, 1), size(evt_map_downsampled, 2)], xx_select, yy_select);
+    evt_domain_projection(ind_2d) = evt_domain_projection(ind_2d) + 1;
+end
+imagesc(evt_domain_projection)
 %% 
 k_nmf_comp = 8; % number of components in NMF
 unmasked_indices = find(mask_downsampled);
@@ -159,7 +174,7 @@ spatial_components = reshape(W_full, [new_height, new_width, k_nmf_comp]);
 temporal_traces = H;
 
 norm(W * H - unmasked_X_dFF) / norm(unmasked_X_dFF)
-%%
+
 ethogram_mat = ethogram_mat_downsampled((select_start+1):select_end, :);
 plotNMF_withBehaviorOnsets(H, ethogram_mat', 40/temp_down_factor, W_full, [new_height, new_width])
 
@@ -229,10 +244,12 @@ opts.printEvery = 10;
 
 [A, C, info] = custom_cnmf(X_dFF', new_height, new_width, k_nmf_comp, mask_downsampled, opts);
 
-norm(A(unmasked_indices, :) * C + info.b(unmasked_indices) * info.f - unmasked_X_dFF) / norm(unmasked_X_dFF)
-%% Visualize component k footprint
+norm(A(unmasked_indices, :) * C + info.B(unmasked_indices, :) * info.F - unmasked_X_dFF) / norm(unmasked_X_dFF)
+% Visualize component k footprint
 ethogram_mat = ethogram_mat_downsampled((select_start+1):select_end, :);
 plotNMF_withBehaviorOnsets(C, ethogram_mat', 40/temp_down_factor, A, [new_height, new_width])
+
+imagesc(reshape(info.B(:,1), [new_height, new_width]))
 
 %% Train / test evaluation for vanilla NMF (time-split CV)
 

@@ -54,24 +54,33 @@ DtD = build_DtD(T);
 rng(opts.seed);
 
 % initialize background first (if use_background)
+r = opts.bg_rank;
+
 if opts.use_background
-    bgopts = struct('bg_rank', opts.bg_rank, ...
-                    'use_quiet_init', true, ...
-                    'quiet_prctile', 20, ...
-                    'n_refine', 1, ...
-                    'nonneg_mode', "clip");
-    [B, F] = init_background_lowrank(X, bgopts);
+    bgopts = struct();
+    bgopts.bg_rank = r;
+    bgopts.use_quiet_init = true;
+    bgopts.quiet_prctile = opts.bg_quiet_prctile;
+    bgopts.n_refine = 1;
+    bgopts.nonneg_mode = "clip";
+    bgopts.eps0 = opts.bg_eps;
+    [B, F] = init_background_lowrank(X, bgopts);   % B: Pm x r, F: r x T
 else
     B = zeros(Pm, 0);
     F = zeros(0, T);
 end
 
+
 % Residual for component init
 Xr = X - B*F;
 Xr = max(Xr, 0);  % keep nonnegativity
 
-% Now SVD init on residual (not on X)
-[U,S,V] = svds(Xr, K);
+try
+    [U,S,V] = svds(Xr, K);
+catch
+    [U,S,V] = svd(Xr, 'econ');
+    U = U(:,1:K); S = S(1:K,1:K); V = V(:,1:K);
+end
 Aact = max(0, U * sqrt(S));
 C    = max(0, (sqrt(S) * V'));
 
@@ -158,24 +167,25 @@ for it = 1:opts.maxIter
     % (2) Update background (B,F) by closed-form NNLS (rank-1)
     % =========================
     if opts.use_background
-        % Update F (rxT): minimize ||(X - A*C) - B*F||^2 with F>=0
-        R0 = X - Aact*C;
+        R0 = X - Aact*C;         % Pm x T, residual without background
+    
         % ---- Update F: (B'B)F = B'R0
-        BtB = (B' * B) + eps0 * eye(r);     % r x r
-        F   = BtB \ (B' * R0);              % r x T
-        F   = max(0, F);
-        
-        % ---- Update B: B = R0*F'*(FF')^{-1}
-        % Use transpose trick to avoid right-division:
-        % B' = (FF')^{-1} * (F * R0')
-        FFt = (F * F') + eps0 * eye(r);     % r x r
-        B   = (FFt \ (F * R0'))';           % Pm x r
-        B   = max(0, B);
-        
-        % (optional) normalize columns of B to stabilize scaling
-        colnorm = sqrt(sum(B.^2,1)) + eps0; % 1 x r
-        B = B ./ colnorm;
-        F = F .* colnorm';
+        BtB = (B' * B) + opts.bg_eps * eye(r);
+        % Use chol solve (SPD) for stability:
+        Lb = chol(BtB, 'lower');
+        F = Lb'\(Lb\(B' * R0));
+        F = max(F, 0);
+    
+        % ---- Update B: B' = (FF')^{-1} (F R0')
+        FFt = (F * F') + opts.bg_eps * eye(r);
+        Lf = chol(FFt, 'lower');
+        B = (Lf'\(Lf\(F * R0')))';
+        B = max(B, 0);
+    
+        % Optional stabilization: normalize columns of B, rescale F
+        coln = sqrt(sum(B.^2,1)) + opts.bg_eps;
+        B = B ./ coln;
+        F = F .* coln';
     end
 
     % =========================
@@ -259,8 +269,8 @@ A = zeros(P, K);
 A(idx, :) = Aact;
 
 % Save background in info (doesn't change function signature)
-info.B = zeros(P,1);
-info.B(idx) = B;
+info.B = zeros(P,size(B,2));
+info.B(idx, :) = B;
 info.F = F;
 
 end
@@ -373,7 +383,7 @@ def.bg_rank = 3;
 def.use_quiet_init = true;
 def.quiet_prctile = 20;
 def.n_refine = 1;
-def.nonneg_mode = "clip"; % safest for dF/F init
+def.nonneg_mode = "none"; % safest for dF/F init
 def.eps0 = 1e-12;
 
 f = fieldnames(def);
@@ -418,6 +428,8 @@ function opts = set_default_opts(opts)
     % NEW: background term
     def.use_background = true;
     def.bg_rank = 3;
+    def.bg_eps = 1e-12;          % small ridge for SPD solves
+    def.bg_quiet_prctile = 20;   % for init (optional)
 
     % NEW: backtracking safeguard
     def.backtracking = true;
@@ -521,6 +533,7 @@ function X = soft_thresh_nonneg(X, tau)
     X = max(0, X - tau);
 end
 
+% L2-normalization on the columns of A
 function [A, C] = normalize_factors(A, C)
     colNorm = sqrt(sum(A.^2, 1)) + eps;
     A = A ./ colNorm;

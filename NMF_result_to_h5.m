@@ -96,16 +96,16 @@ mask_downsampled(mask_downsampled >= 0.5) = 1;
 new_subset_cutting_points = cumsum(floor(video_lengths ./ temp_down_factor)); % update the subset cutting points
 new_subset_cutting_points = [0; new_subset_cutting_points]; % include 0 at beginning
 
-n_video_select = 32;
-start_video = 1;
-select_start = new_subset_cutting_points(start_video); % not including starting index of the video, so it can be 0
-select_end = new_subset_cutting_points(n_video_select+1);
-voxel_baseline = zeros(size(datOrg1_downsampled_smoothed(:,:,(select_start+1):select_end)));
+n_video_select = 10;
+start_video = 11;
+select_start = new_subset_cutting_points(start_video); % global, not including starting index of the video, so it can be 0
+select_end = new_subset_cutting_points(start_video + n_video_select); % global
+voxel_baseline = zeros(size(datOrg1_downsampled_smoothed(:,:,(select_start+1):select_end))); % local 
 for ii = 1:n_video_select
-    start_ii = new_subset_cutting_points(ii)+1;
-    end_ii = new_subset_cutting_points(ii+1);
-    single_video_baseline = find_baseline_all_voxel(datOrg1_downsampled_smoothed(:,:,start_ii:end_ii), 40, 8);
-    voxel_baseline(:,:,start_ii:end_ii) = single_video_baseline;
+    start_ii = new_subset_cutting_points(ii+start_video-1)+1; % global
+    end_ii = new_subset_cutting_points(ii+start_video); % global
+    single_video_baseline = find_baseline_all_voxel(datOrg1_downsampled_smoothed(:,:,start_ii:end_ii), 40, 8); % global
+    voxel_baseline(:,:,(start_ii-select_start):(end_ii-select_start)) = single_video_baseline; % local
 end
 
 dFF = (datOrg1_downsampled_smoothed(:,:,(select_start+1):select_end) - voxel_baseline)./voxel_baseline;
