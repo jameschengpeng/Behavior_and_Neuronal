@@ -199,6 +199,7 @@ opts.lambdaA_excl = 0;        % OFF initially (overlap is allowed)
 % Temporal penalty
 % =====================
 opts.lambdaC_smooth = 1e-3;   % smooth calcium dynamics
+opts.lambdaF_smooth = 1e-2;
 
 % =====================
 % Step sizes / solver
@@ -249,7 +250,7 @@ norm(A(unmasked_indices, :) * C + info.B(unmasked_indices, :) * info.F - unmaske
 ethogram_mat = ethogram_mat_downsampled((select_start+1):select_end, :);
 plotNMF_withBehaviorOnsets(C, ethogram_mat', 40/temp_down_factor, A, [new_height, new_width])
 
-imagesc(reshape(info.B(:,1), [new_height, new_width]))
+imagesc(reshape(info.B(:,2), [new_height, new_width]))
 
 %% Train / test evaluation for vanilla NMF (time-split CV)
 

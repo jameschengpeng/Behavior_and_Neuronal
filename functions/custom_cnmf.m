@@ -168,13 +168,29 @@ for it = 1:opts.maxIter
     % =========================
     if opts.use_background
         R0 = X - Aact*C;         % Pm x T, residual without background
-    
-        % ---- Update F: (B'B)F = B'R0
-        BtB = (B' * B) + opts.bg_eps * eye(r);
-        % Use chol solve (SPD) for stability:
-        Lb = chol(BtB, 'lower');
-        F = Lb'\(Lb\(B' * R0));
-        F = max(F, 0);
+        R0pos = max(R0, 0);
+        
+        g = mean(R0pos, 1);                  % 1 x T
+        quiet_idx = g <= prctile(g, opts.bg_quiet_prctile);
+        if nnz(quiet_idx) < max(10, 2*r)
+            quiet_idx = true(1, T);          % fallback
+        end
+        
+        R0q = R0pos(:, quiet_idx);           % Pm x Tq
+        % ---- Update F with temporal smoothness (projected gradient)
+        BtB = (B' * B) + opts.bg_eps * eye(r);   % r x r
+        BR0 = (B' * R0);                         % r x T
+        
+        % Lipschitz bound: ||BtB||_2 + lambdaF*||DtD||_2, and ||DtD||_2 <= 4
+        LipF = norm(BtB, 2) + opts.lambdaF_smooth * 4;
+        etaF = 0.9 / (LipF + eps);
+        
+        nInnerF = 5;  % NEW: you can expose as opts.innerF if you want
+        for sF = 1:nInnerF
+            gradF = (BtB * F - BR0) + opts.lambdaF_smooth * (F * DtD);
+            F = max(0, F - etaF * gradF);
+        end
+
     
         % ---- Update B: B' = (FF')^{-1} (F R0')
         FFt = (F * F') + opts.bg_eps * eye(r);
@@ -411,6 +427,7 @@ function opts = set_default_opts(opts)
     def.lambdaA_lap = 1e-4;
     def.lambdaA_excl = 0;          % start OFF
     def.lambdaC_smooth = 1e-4;
+    def.lambdaF_smooth = 1e-2; % background should be very smooth (often >= lambdaC_smooth)
 
     def.etaA = 1e-3;
     def.etaC = 1e-3;
@@ -471,7 +488,12 @@ function obj = objective_val(X, A, C, B, F, L, DtD, opts)
         smoothCTerm = 0.5 * opts.lambdaC_smooth * trace(C * (DtD * C'));
     end
 
-    obj = fitTerm + lapTerm + l1Term + exclTerm + smoothCTerm;
+    smoothFTerm = 0;
+    if opts.lambdaF_smooth > 0 && ~isempty(F)
+        smoothFTerm = 0.5 * opts.lambdaF_smooth * trace(F * (DtD * F'));
+    end
+
+    obj = fitTerm + lapTerm + l1Term + exclTerm + smoothCTerm + smoothFTerm;
 end
 
 function DtD = build_DtD(T)
