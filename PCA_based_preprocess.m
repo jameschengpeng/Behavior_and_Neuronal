@@ -4,18 +4,29 @@ clc
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\scalable_calcium_model_prev'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 %%
+% For the CCK neuronal data
+% AQuA2_result_path = "D:\Mouse_behavior_data\D21\AQuA2";
+% Ethogram_scoring_path = "D:\Mouse_behavior_data\D21\EthogramScoring";
+
+% For the GGP data, various mice, various days
+mouse_num = 2;
+day = 28;
+AQuA2_file_suffix = "moco_cropped_AQuA2"; % "ManualMoco_cropped_AQuA2" for CCK
+AQuA2_result_path = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day));
+Ethogram_scoring_path = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\EthogramScoring");
+
 % For all recordings
-[dF1, datOrg1, evt_map, subset_cutting_points, early_reaction_regions] = concat_videos("D:\Mouse_behavior_data\D21\AQuA2", "ManualMoco_cropped_AQuA2");
+[dF1, datOrg1, evt_map, subset_cutting_points, early_reaction_regions] = concat_videos(AQuA2_result_path, AQuA2_file_suffix);
 
 % add 0 to the first element of subset_cutting_points
 subset_cutting_points = [0; subset_cutting_points];
 
-concat_ethogram_mat = concat_ethograms("D:\Mouse_behavior_data\D21\EthogramScoring", subset_cutting_points);
+concat_ethogram_mat = concat_ethograms(Ethogram_scoring_path, subset_cutting_points);
 
 video_lengths = diff(subset_cutting_points);
 
 % load the mask
-mask = load("D:\Mouse_behavior_data\D21\AQuA2\mask.mat");
+mask = load(fullfile(AQuA2_result_path, "mask.mat"));
 mask = mask.bd0;
 upper_unmasked = mask{1}{2};
 lower_unmasked = mask{2}{2};
@@ -26,7 +37,7 @@ mask(lower_unmasked) = 1;
 %% Downsampling
 % Downsample in spatial and temporal dimensions
 spa_down_factor = 2;
-temp_down_factor = 4;
+temp_down_factor = 10; % 10 for astrocytes
 [height, width, nframes] = size(dF1);
 
 new_height = floor(height / spa_down_factor);
@@ -99,11 +110,6 @@ mask_downsampled = imresize(mask, [new_height, new_width]);
 mask_downsampled(mask_downsampled < 0.5) = 0;
 mask_downsampled(mask_downsampled >= 0.5) = 1;
 
-% save preprocessed dF and datOrg
-save("D:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat", "dF1_downsampled_smoothed", "datOrg1_downsampled_smoothed", ...
-    "ethogram_mat_downsampled", "subset_cutting_points", "evt_map_downsampled", "mask_downsampled", "-v7.3");
-
-
 % -------------------------------------------------------------------------
 % Reshape: each row = one frame, each column = one pixel
 X_dF = reshape(dF1_downsampled_smoothed, [], new_frames);
@@ -113,8 +119,8 @@ if min(X_dF(:)) < 0
 end
 
 %% compute the baseline for dF/F
-n_video_select = 10;
-start_video = 11;
+n_video_select = numel(new_subset_cutting_points)-1; % all
+start_video = 1;
 select_start = new_subset_cutting_points(start_video); % global, not including starting index of the video, so it can be 0
 select_end = new_subset_cutting_points(start_video + n_video_select); % global
 voxel_baseline = zeros(size(datOrg1_downsampled_smoothed(:,:,(select_start+1):select_end))); % local 
@@ -131,6 +137,17 @@ X_dFF = X_dFF';
 if min(X_dFF(:)) < 0
     X_dFF = X_dFF - min(X_dFF(:));  
 end
+
+% save preprocessed dF and datOrg
+% save("D:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat", "dF1_downsampled_smoothed", "datOrg1_downsampled_smoothed", ...
+%     "ethogram_mat_downsampled", "subset_cutting_points", "evt_map_downsampled", "mask_downsampled", "-v7.3");
+
+savefile = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\downsampled_smoothed_data_all_videos.mat");
+save(savefile, "dF1_downsampled_smoothed", "datOrg1_downsampled_smoothed", ...
+    "ethogram_mat_downsampled", "new_subset_cutting_points", "evt_map_downsampled", ...
+    "dFF", "mask_downsampled", "temp_down_factor", "-v7.3");
+
+
 %%
 evt_domain_projection = zeros(size(evt_map_downsampled, 1), size(evt_map_downsampled, 2));
 conn = bwconncomp(evt_map_downsampled, 6);
@@ -184,7 +201,7 @@ opts = struct();
 % =====================
 % Iteration / stopping
 % =====================
-opts.maxIter   = 200;
+opts.maxIter   = 100;
 opts.minIter   = 60;
 opts.tol       = 1e-5;
 
@@ -250,6 +267,7 @@ norm(A(unmasked_indices, :) * C + info.B(unmasked_indices, :) * info.F - unmaske
 ethogram_mat = ethogram_mat_downsampled((select_start+1):select_end, :);
 plotNMF_withBehaviorOnsets(C, ethogram_mat', 40/temp_down_factor, A, [new_height, new_width])
 
+figure
 imagesc(reshape(info.B(:,2), [new_height, new_width]))
 
 %% Train / test evaluation for vanilla NMF (time-split CV)
@@ -465,7 +483,7 @@ for k = 1:nPC
     subplot(2,3,k)
     imagesc(reshape(coeff(:,k), new_height, new_width))
     axis image off
-    colormap gray
+    colormap parula
     title(sprintf('PC %d (%.2f%%)', k, explained(k)))
 end
 

@@ -5,8 +5,16 @@ concat_datOrg = [];
 concat_evt_map = [];
 subset_cutting_points = []; % if you want a subset of data, here are indices on time axis to cut
 
-for video_idx = 1:32
-    indexStr = sprintf('%02d', video_idx);
+matFiles = dir(fullfile(folder, "data*.mat"));
+video_num = {};
+for f = 1:numel(matFiles)
+    matName = string(matFiles(f).name);
+    tok = regexp(matName, '^data(\d{2})', 'tokens', 'once');
+    video_num = [video_num tok];
+end
+
+for video_idx = 1:numel(video_num)
+    indexStr = video_num{video_idx};
     aqua_result_file = strcat("data", indexStr, "_", file_suffix, ".mat");
     aqua_result = load(fullfile(folder, aqua_result_file));
     
@@ -29,7 +37,7 @@ for video_idx = 1:32
     concat_datOrg = cat(3, concat_datOrg, datOrg1);
     concat_evt_map = cat(3, concat_evt_map, evt_map);
     subset_cutting_points = [subset_cutting_points; size(datOrg1, 3)];
-    fprintf('Processed file %d\n', video_idx);
+    fprintf('Processed file %s\n', indexStr);
 end
 subset_cutting_points = cumsum(subset_cutting_points);
 end

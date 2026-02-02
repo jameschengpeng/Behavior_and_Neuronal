@@ -167,42 +167,51 @@ for it = 1:opts.maxIter
     % (2) Update background (B,F) by closed-form NNLS (rank-1)
     % =========================
     if opts.use_background
-        R0 = X - Aact*C;         % Pm x T, residual without background
-        R0pos = max(R0, 0);
-        
-        g = mean(R0pos, 1);                  % 1 x T
-        quiet_idx = g <= prctile(g, opts.bg_quiet_prctile);
-        if nnz(quiet_idx) < max(10, 2*r)
-            quiet_idx = true(1, T);          % fallback
-        end
-        
-        R0q = R0pos(:, quiet_idx);           % Pm x Tq
-        % ---- Update F with temporal smoothness (projected gradient)
-        BtB = (B' * B) + opts.bg_eps * eye(r);   % r x r
-        BR0 = (B' * R0);                         % r x T
-        
-        % Lipschitz bound: ||BtB||_2 + lambdaF*||DtD||_2, and ||DtD||_2 <= 4
-        LipF = norm(BtB, 2) + opts.lambdaF_smooth * 4;
-        etaF = 0.9 / (LipF + eps);
-        
-        nInnerF = 5;  % NEW: you can expose as opts.innerF if you want
-        for sF = 1:nInnerF
-            gradF = (BtB * F - BR0) + opts.lambdaF_smooth * (F * DtD);
-            F = max(0, F - etaF * gradF);
-        end
-
+        Xpos = max(X,0);
+        g = mean(Xpos, 1);                       % global activity proxy
     
-        % ---- Update B: B' = (FF')^{-1} (F R0')
-        FFt = (F * F') + opts.bg_eps * eye(r);
-        Lf = chol(FFt, 'lower');
-        B = (Lf'\(Lf\(F * R0')))';
-        B = max(B, 0);
+        % optional: high-pass to avoid slow drift dominating threshold
+        g_slow = movmedian(g, 201);
+        g_hp = g - g_slow;
+    
+        quiet_idx = g_hp <= prctile(g_hp, opts.bg_quiet_prctile);
+        if nnz(quiet_idx) < max(10, 2*r)
+            quiet_idx = true(1, T);
+        end
+    
+        R0 = X - Aact*C;
+        R0pos = max(R0, 0);                      % <-- IMPORTANT: define it
+        R0q = R0pos(:, quiet_idx);               % <-- use consistent nonneg residual
+    
+        % ---- Update B using QUIET frames only
+        Fq  = F(:, quiet_idx);
+    
+        G   = (Fq * Fq');                        % r x r
+        RHS = (R0q * Fq');                       % Pm x r
+    
+        % Lipschitz bound for B: ||G||_2 + lambdaB*||L||_2, with ||L||_2 <= 2*dmax
+        LipL = 2 * opts.neighborhood;
+        LipB = norm(G, 2) + opts.lambdaB_lap * LipL;
+        etaB = 0.9 / (LipB + eps);
+    
+        for sB = 1:opts.innerB
+            gradB = (B * G - RHS) + opts.lambdaB_lap * (L * B);
+            B = max(0, B - etaB * gradB);
+        end
+    
+        % ---- Update F on ALL frames using full residual (but B fixed)
+        BtB = (B' * B) + opts.bg_eps * eye(r);
+        Lb = chol(BtB, 'lower');
+        F = Lb'\(Lb\(B' * R0pos));               % <-- now defined
+        F = max(F, 0);
     
         % Optional stabilization: normalize columns of B, rescale F
         coln = sqrt(sum(B.^2,1)) + opts.bg_eps;
         B = B ./ coln;
         F = F .* coln';
     end
+
+
 
     % =========================
     % (3) Update A (prox-grad: fit + lap + excl, then L1+nonneg prox)
@@ -428,6 +437,8 @@ function opts = set_default_opts(opts)
     def.lambdaA_excl = 0;          % start OFF
     def.lambdaC_smooth = 1e-4;
     def.lambdaF_smooth = 1e-2; % background should be very smooth (often >= lambdaC_smooth)
+    def.lambdaB_lap = 5e-3;   % start ~ 5–20x lambdaA_lap
+    def.innerB = 3;           % how many gradient steps for B
 
     def.etaA = 1e-3;
     def.etaC = 1e-3;
