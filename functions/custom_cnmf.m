@@ -145,6 +145,9 @@ for it = 1:opts.maxIter
         % grad wrt C: A'*(A*C + B*F - X) + lambdaC*(C*DtD)
         R = (Aact*C + B*F) - X;
         gradC = (Aact' * R) + opts.lambdaC_smooth * (C * DtD);
+        if it == 30
+            disp(1)
+        end
         Cnew = max(0, C - etaC * gradC);
 
         if opts.backtracking

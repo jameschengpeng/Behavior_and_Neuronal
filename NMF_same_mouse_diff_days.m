@@ -15,7 +15,7 @@ data2 = load(savefile2);
 X_dFF1 = reshape(data1.dFF, [], size(data1.dFF, 3));
 X_dFF2 = reshape(data2.dFF, [], size(data2.dFF, 3));
 
-k_nmf_comp = 4; % number of components in NMF
+k_nmf_comp = 6; % number of components in NMF
 
 combined_mask = zeros(size(data1.mask_downsampled));
 combined_mask(data1.mask_downsampled + data2.mask_downsampled == 2) = 1; % take the intersection of the two masks as active area
@@ -96,15 +96,183 @@ new_width = size(data1.datOrg1_downsampled_smoothed, 2);
 
 [A, C1, info] = custom_cnmf(X_dFF1, new_height, new_width, k_nmf_comp, combined_mask, opts);
 
-norm(A(unmasked_indices, :) * C1 + info.B(unmasked_indices, :) * info.F - unmasked_X_dFF1) / norm(unmasked_X_dFF1)
+norm(A(unmasked_indices, :) * C1 + info.B(unmasked_indices, :) * info.F - unmasked_X_dFF1, 'fro') / norm(unmasked_X_dFF1, 'fro')
 % Visualize component k footprint
-ethogram_mat = data1.ethogram_mat_downsampled;
-plotNMF_withBehaviorOnsets(C1, ethogram_mat', 40/data1.temp_down_factor, A, [new_height, new_width])
+ethogram_mat1 = data1.ethogram_mat_downsampled;
+plotNMF_withBehaviorOnsets(C1, ethogram_mat1', 40/data1.temp_down_factor, A, [new_height, new_width])
 
 figure
 imagesc(reshape(info.B(:,1), [new_height, new_width]))
 
+%% use the A and B to infer C and F
+[C2, F] = estimate_CF_from_fixed_AB(X_dFF2, A, info.B);
+ethogram_mat2 = data2.ethogram_mat_downsampled;
+plotNMF_withBehaviorOnsets(C2, ethogram_mat2', 40/data2.temp_down_factor, A, [new_height, new_width])
+
+%% evaluate the fitting 
+Xhat = A(unmasked_indices,:) * C2 + info.B(unmasked_indices,:) * F;
+R = Xhat - unmasked_X_dFF2;
+R2_global = 1 - (norm(R,'fro')^2 / ...
+    norm(unmasked_X_dFF2 - mean(unmasked_X_dFF2(:)),'fro')^2)
+X_centered = unmasked_X_dFF2 - mean(unmasked_X_dFF2, 2);
+
+R2_pixelCentered = 1 - (norm(R,'fro')^2 / ...
+    norm(X_centered,'fro')^2)
+nrmse = norm(R,'fro') / norm(unmasked_X_dFF2,'fro')
+relerr = norm(R,'fro') / norm(unmasked_X_dFF2,'fro')
+nrmse_centered = norm(R,'fro') / norm(X_centered,'fro')
 %%
+fs = 4;                 % Hz
+win_sec = 10;           % seconds
+win = max(3, round(win_sec*fs));
+if mod(win,2)==0, win = win+1; end
+
+F_smooth = F;
+for k = 1:size(F,1)
+    F_smooth(k,:) = smoothdata(F(k,:), 'movmean', win);
+end
+
+Xhat_smooth = A(unmasked_indices,:) * C2 + info.B(unmasked_indices,:) * F_smooth;
+R_smooth = Xhat_smooth - unmasked_X_dFF2;
+
+R2_pixelCentered_smooth = 1 - norm(R_smooth,'fro')^2 / ...
+    (norm(unmasked_X_dFF2 - mean(unmasked_X_dFF2,2),'fro')^2 + eps)
+
+
+%%
+meanAbsResidual = mean(abs(R), 2);
+meanAbsResidual_org = zeros(new_width*new_height, 1);
+meanAbsResidual_org(unmasked_indices) = meanAbsResidual;
+
+imagesc(reshape(meanAbsResidual_org, new_height, new_width));
+axis image; colorbar;
+title('Mean |Residual| on Day 28');
+
+%%
+SSE_t = sum(R.^2, 1);
+SST_t = sum((unmasked_X_dFF2 - mean(unmasked_X_dFF2,1)).^2, 1);
+
+R2_time = 1 - SSE_t ./ (SST_t + eps);
+
+figure;
+plot(R2_time);
+ylim([0 1]);
+title('R^2 per time frame (Day 28)');
+xlabel('Frame');
+ylabel('R^2');
+%%
+kshow = randperm(size(C2,1), min(10,size(C2,1)));
+
+figure;
+plot(C2(kshow,:)');
+title('Sample inferred neuron activity traces C2 (Day 28)');
+
+%%
+C = C2;
+ethogram_mat = ethogram_mat2;
+ethogram_mat = ethogram_mat > 0.5;
+
+fs = 4;
+
+% windows for astrocytes (slow)
+pre_sec  = 10;
+post_sec = 20;
+pre  = round(pre_sec*fs);
+post = round(post_sec*fs);
+win = -pre:post;
+
+baseline_idx = win < 0;
+response_idx = win >= 0 & win <= round(10*fs);  % first 10 s after onset
+
+T = size(C,2);
+K = size(C,1);                 % should be 6
+B = size(ethogram_mat,2);      % should be 9
+
+% onset_mat from ethogram_mat
+onset_mat = zeros(size(ethogram_mat));
+for b = 1:B
+    onset_mat(:,b) = ([0; diff(ethogram_mat(:,b))] == 1);
+end
+
+AUC_all = nan(B,1);
+p_perm_all = nan(B,1);
+pvals_components = nan(K,B);
+
+for b = 1:B
+    onset_frames = find(onset_mat(:,b) == 1);
+
+    % keep only those with full window available
+    onset_frames = onset_frames(onset_frames - pre >= 1 & onset_frames + post <= T);
+    N = numel(onset_frames);
+    if N < 5
+        continue
+    end
+
+    % event-aligned C
+    C_event = zeros(K, numel(win), N);
+    for i = 1:N
+        t0 = onset_frames(i);
+        C_event(:,:,i) = C(:, t0+win);
+    end
+
+    % effect size: response - baseline per component per event
+    baseline = squeeze(mean(C_event(:,baseline_idx,:), 2));   % K x N
+    response = squeeze(mean(C_event(:,response_idx,:), 2));   % K x N
+    delta = response - baseline;                               % K x N
+
+    % component-level t-tests
+    for k = 1:K
+        [~, pvals_components(k,b)] = ttest(delta(k,:));
+    end
+
+    % permutation test on a scalar summary effect
+    true_effect = mean(delta(:));
+    nShuffle = 1000;
+    shuf_effect = zeros(nShuffle,1);
+    for s = 1:nShuffle
+        shuf = randi([pre+1, T-post], size(onset_frames));
+        C_shuf = zeros(K, numel(win), N);
+        for i = 1:N
+            t0 = shuf(i);
+            C_shuf(:,:,i) = C(:, t0+win);
+        end
+        base_s = squeeze(mean(C_shuf(:,baseline_idx,:),2));
+        resp_s = squeeze(mean(C_shuf(:,response_idx,:),2));
+        shuf_effect(s) = mean((resp_s - base_s), 'all');
+    end
+    p_perm_all(b) = mean(shuf_effect >= true_effect);
+
+    % decoding (AUC) — use a small positive window to label frames near onset
+    y = onset_mat(:,b);                 % T x 1
+    X = C';                             % T x 6
+
+    % optional: label +/- 1 s around onset as positive to account for slow timing
+    pad_sec = 1;
+    pad = round(pad_sec*fs);
+    y_pad = y;
+    idx = find(y==1);
+    for ii = 1:numel(idx)
+        y_pad(max(1,idx(ii)-pad):min(T,idx(ii)+pad)) = 1;
+    end
+
+    % simple 5-fold CV AUC
+    cv = cvpartition(T, 'KFold', 5);
+    yhat = zeros(T,1);
+
+    for fold = 1:5
+        tr = training(cv, fold);
+        te = test(cv, fold);
+        mdl = fitglm(X(tr,:), y_pad(tr), 'Distribution','binomial');
+        yhat(te) = predict(mdl, X(te,:));
+    end
+
+    [~,~,~,AUC_all(b)] = perfcurve(y_pad, yhat, 1);
+end
+
+AUC_all
+p_perm_all
+pvals_components
+
 
 
 %%

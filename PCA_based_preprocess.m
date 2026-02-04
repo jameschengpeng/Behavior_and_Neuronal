@@ -4,16 +4,18 @@ clc
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\scalable_calcium_model_prev'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 %%
+AQuA2_file_suffix = "ManualMoco_cropped_AQuA2"; % "ManualMoco_cropped_AQuA2" for CCK; "moco_cropped_AQuA2" for astrocyte
+
 % For the CCK neuronal data
-% AQuA2_result_path = "D:\Mouse_behavior_data\D21\AQuA2";
-% Ethogram_scoring_path = "D:\Mouse_behavior_data\D21\EthogramScoring";
+AQuA2_result_path = "D:\Mouse_behavior_data\D21\AQuA2";
+Ethogram_scoring_path = "D:\Mouse_behavior_data\D21\EthogramScoring";
 
 % For the GGP data, various mice, various days
-mouse_num = 2;
-day = 28;
-AQuA2_file_suffix = "moco_cropped_AQuA2"; % "ManualMoco_cropped_AQuA2" for CCK
-AQuA2_result_path = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day));
-Ethogram_scoring_path = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\EthogramScoring");
+% mouse_num = 2;
+% day = 28;
+% 
+% AQuA2_result_path = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day));
+% Ethogram_scoring_path = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\EthogramScoring");
 
 % For all recordings
 [dF1, datOrg1, evt_map, subset_cutting_points, early_reaction_regions] = concat_videos(AQuA2_result_path, AQuA2_file_suffix);
@@ -37,7 +39,7 @@ mask(lower_unmasked) = 1;
 %% Downsampling
 % Downsample in spatial and temporal dimensions
 spa_down_factor = 2;
-temp_down_factor = 10; % 10 for astrocytes
+temp_down_factor = 4; 
 [height, width, nframes] = size(dF1);
 
 new_height = floor(height / spa_down_factor);
@@ -139,13 +141,15 @@ if min(X_dFF(:)) < 0
 end
 
 % save preprocessed dF and datOrg
-% save("D:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat", "dF1_downsampled_smoothed", "datOrg1_downsampled_smoothed", ...
-%     "ethogram_mat_downsampled", "subset_cutting_points", "evt_map_downsampled", "mask_downsampled", "-v7.3");
-
-savefile = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\downsampled_smoothed_data_all_videos.mat");
+savefile = "D:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat";
 save(savefile, "dF1_downsampled_smoothed", "datOrg1_downsampled_smoothed", ...
     "ethogram_mat_downsampled", "new_subset_cutting_points", "evt_map_downsampled", ...
     "dFF", "mask_downsampled", "temp_down_factor", "-v7.3");
+
+% savefile = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\downsampled_smoothed_data_all_videos.mat");
+% save(savefile, "dF1_downsampled_smoothed", "datOrg1_downsampled_smoothed", ...
+%     "ethogram_mat_downsampled", "new_subset_cutting_points", "evt_map_downsampled", ...
+%     "dFF", "mask_downsampled", "temp_down_factor", "-v7.3");
 
 
 %%
@@ -195,13 +199,20 @@ norm(W * H - unmasked_X_dFF) / norm(unmasked_X_dFF)
 ethogram_mat = ethogram_mat_downsampled((select_start+1):select_end, :);
 plotNMF_withBehaviorOnsets(H, ethogram_mat', 40/temp_down_factor, W_full, [new_height, new_width])
 
+%%
+ethogram_mat = ethogram_mat > 0.5;
+Z = nmf_behavior_onset_zscore(C, ethogram_mat, 40/temp_down_factor, 2, 2);  % returns K x 9
+Z(Z < 2) = -10;
+figure
+imagesc(Z)
+
 %% constrained NMF
 opts = struct();
-
+opts.quiet_prctile = 20;
 % =====================
 % Iteration / stopping
 % =====================
-opts.maxIter   = 100;
+opts.maxIter   = 150;
 opts.minIter   = 60;
 opts.tol       = 1e-5;
 
@@ -215,7 +226,7 @@ opts.lambdaA_excl = 0;        % OFF initially (overlap is allowed)
 % =====================
 % Temporal penalty
 % =====================
-opts.lambdaC_smooth = 1e-3;   % smooth calcium dynamics
+opts.lambdaC_smooth = 5e-3;   % smooth calcium dynamics
 opts.lambdaF_smooth = 1e-2;
 
 % =====================
@@ -235,7 +246,7 @@ opts.normalizeEvery = 10;     % NOT every iteration (important)
 % Background modeling
 % =====================
 opts.use_background = true;   % CRITICAL for clean A maps
-opts.bg_rank = 2; % allow background to be of multi-rank
+opts.bg_rank = 1; % allow background to be of multi-rank
 % =====================
 % Nonnegativity handling
 % =====================
@@ -260,15 +271,16 @@ opts.verbose     = true;
 opts.printEvery = 10;
 
 
-[A, C, info] = custom_cnmf(X_dFF', new_height, new_width, k_nmf_comp, mask_downsampled, opts);
+[A, C, info] = custom_cnmf(X_dFF(1:1500, :)', new_height, new_width, k_nmf_comp, mask_downsampled, opts);
 
-norm(A(unmasked_indices, :) * C + info.B(unmasked_indices, :) * info.F - unmasked_X_dFF) / norm(unmasked_X_dFF)
+norm(A(unmasked_indices, :) * C + info.B(unmasked_indices, :) * info.F - unmasked_X_dFF(:, 1:1500), 'fro') / norm(unmasked_X_dFF(:, 1:1500), 'fro')
 % Visualize component k footprint
-ethogram_mat = ethogram_mat_downsampled((select_start+1):select_end, :);
+% ethogram_mat = ethogram_mat_downsampled((select_start+1):select_end, :);
+ethogram_mat = ethogram_mat_downsampled(1:1500, :);
 plotNMF_withBehaviorOnsets(C, ethogram_mat', 40/temp_down_factor, A, [new_height, new_width])
 
 figure
-imagesc(reshape(info.B(:,2), [new_height, new_width]))
+imagesc(reshape(info.B(:,1), [new_height, new_width]))
 
 %% Train / test evaluation for vanilla NMF (time-split CV)
 
