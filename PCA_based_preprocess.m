@@ -152,6 +152,27 @@ save(savefile, "dF1_downsampled_smoothed", "datOrg1_downsampled_smoothed", ...
 %     "dFF", "mask_downsampled", "temp_down_factor", "-v7.3");
 
 
+%% read the saved data, you can start here
+savefile = "D:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat";
+saved_data = load(savefile);
+dF1_downsampled_smoothed        = saved_data.dF1_downsampled_smoothed;
+datOrg1_downsampled_smoothed    = saved_data.datOrg1_downsampled_smoothed;
+ethogram_mat_downsampled        = saved_data.ethogram_mat_downsampled;
+new_subset_cutting_points       = saved_data.new_subset_cutting_points;
+evt_map_downsampled             = saved_data.evt_map_downsampled;
+dFF                             = saved_data.dFF;
+mask_downsampled                = saved_data.mask_downsampled;
+temp_down_factor                = saved_data.temp_down_factor;
+
+X_dFF = reshape(dFF, [], size(dFF, 3));
+X_dFF = X_dFF';
+if min(X_dFF(:)) < 0
+    X_dFF = X_dFF - min(X_dFF(:));  
+end
+
+new_height = size(dF1_downsampled_smoothed, 1);
+new_width = size(dF1_downsampled_smoothed, 2);
+
 %%
 evt_domain_projection = zeros(size(evt_map_downsampled, 1), size(evt_map_downsampled, 2));
 conn = bwconncomp(evt_map_downsampled, 6);
@@ -226,7 +247,7 @@ opts.lambdaA_excl = 0;        % OFF initially (overlap is allowed)
 % =====================
 % Temporal penalty
 % =====================
-opts.lambdaC_smooth = 5e-3;   % smooth calcium dynamics
+opts.lambdaC_smooth = 1e-3;   % smooth calcium dynamics
 opts.lambdaF_smooth = 1e-2;
 
 % =====================
@@ -270,17 +291,43 @@ opts.seed        = 0;
 opts.verbose     = true;
 opts.printEvery = 10;
 
+n_video_train = 10;
+T_train = new_subset_cutting_points(n_video_train+1);
 
-[A, C, info] = custom_cnmf(X_dFF(1:1500, :)', new_height, new_width, k_nmf_comp, mask_downsampled, opts);
+[A, C_train, info_train] = custom_cnmf(X_dFF(1:T_train, :)', new_height, new_width, k_nmf_comp, mask_downsampled, opts);
+%% Use the pre-fitted A and B matrices to figure out the remaining time course
+B = info_train.B;
+[C_test, F_test, info_test] = infer_CF_fixed_AB(X_dFF(T_train+1:end, :)', A, B, new_height, new_width, mask_downsampled, opts);
 
-norm(A(unmasked_indices, :) * C + info.B(unmasked_indices, :) * info.F - unmasked_X_dFF(:, 1:1500), 'fro') / norm(unmasked_X_dFF(:, 1:1500), 'fro')
+C = [C_train C_test];
+F = [info_train.F F_test];
+
+norm(A(unmasked_indices, :) * C + B(unmasked_indices, :) * F - unmasked_X_dFF, 'fro') / norm(unmasked_X_dFF, 'fro')
 % Visualize component k footprint
 % ethogram_mat = ethogram_mat_downsampled((select_start+1):select_end, :);
-ethogram_mat = ethogram_mat_downsampled(1:1500, :);
-plotNMF_withBehaviorOnsets(C, ethogram_mat', 40/temp_down_factor, A, [new_height, new_width])
+ethogram_mat = ethogram_mat_downsampled;
+
+%% add the background into C and A
+C_augmented = [C; F];
+A_augmented = [A B];
+plotNMF_withBehaviorOnsets(C_augmented, ethogram_mat', 40/temp_down_factor, A_augmented, [new_height, new_width])
+
+%% obtain the z-score map
+% for each behavior and each NMF component, we extract the relevant time
+% window, and compute z-score for the signals within time-window compared
+% to the baseline signals
+ethogram_mat = ethogram_mat > 0.5;
+Z = nmf_behavior_onset_zscore(C_augmented, ethogram_mat, 40/temp_down_factor, 3, 2);  % returns K x 9
+Z(Z < 2) = NaN;
 
 figure
-imagesc(reshape(info.B(:,1), [new_height, new_width]))
+h = imagesc(Z);
+set(gca,'Color','k')                  % black background
+set(h,'AlphaData', ~isnan(Z))         % NaNs become transparent -> show black
+xlabel("Behavior type", 'FontSize', 12, 'FontWeight','bold');
+ylabel("NMF component number", 'FontSize', 12, 'FontWeight','bold');
+title("Z-score", 'FontSize', 12, 'FontWeight','bold')
+colorbar
 
 %% Train / test evaluation for vanilla NMF (time-split CV)
 
@@ -676,8 +723,23 @@ function onsetIdx = plotNMF_withBehaviorOnsets(C, E, Fs, A, imgSize)
                 error('imgSize not provided and nPixels is not a perfect square. Provide imgSize = [H W].');
             end
         end
-
         assert(prod(imgSize) == nPix, 'imgSize must satisfy prod(imgSize) == size(A,1).');
+
+        % ---- Global CLim across ALL spatial components (shared mapping) ----
+        Aval = A(:);
+        Aval = Aval(isfinite(Aval)); % ignores NaN/Inf
+        low = prctile(Aval, 1);
+        high = prctile(Aval, 99.5);
+        
+        climGlobal = [low high];
+        % if isempty(Aval)
+        %     climGlobal = [0 1];
+        % else
+        %     climGlobal = [min(Aval) max(Aval)];
+        %     if climGlobal(1) == climGlobal(2)
+        %         climGlobal = climGlobal + [-eps eps];
+        %     end
+        % end
     end
 
     % Time vector
@@ -707,6 +769,7 @@ function onsetIdx = plotNMF_withBehaviorOnsets(C, E, Fs, A, imgSize)
 
     if hasSpatial
         tl = tiledlayout(k, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
+        imgAxes = gobjects(k,1);    % store spatial axes handles
     else
         tl = tiledlayout(k, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
     end
@@ -718,13 +781,19 @@ function onsetIdx = plotNMF_withBehaviorOnsets(C, E, Fs, A, imgSize)
         % ---- Left: spatial component map ----
         if hasSpatial
             axImg = nexttile(tl, (i-1)*2 + 1);
+            imgAxes(i) = axImg;
+
             Ai = reshape(A(:,i), imgSize);
+            Ai(Ai < 1e-6) = NaN;          % mask background
             imagesc(axImg, Ai);
+
             axis(axImg, 'image');
             axis(axImg, 'off');
-            title(axImg, sprintf('A %d', i), 'FontSize', 9, 'FontWeight', 'bold');
-            % optional: keep colormap consistent
-            colormap(axImg, parula);
+            title(axImg, sprintf('Spatial feature %d', i), 'FontSize', 9, 'FontWeight', 'bold');
+
+            colormap(axImg, "hot");
+            set(axImg, 'Color', 'k');   % NaNs appear black
+            clim(axImg, climGlobal);     % <<< shared scaling across ALL spatial plots
         end
 
         % ---- Right: time trace ----
@@ -753,22 +822,31 @@ function onsetIdx = plotNMF_withBehaviorOnsets(C, E, Fs, A, imgSize)
             end
         end
 
-        ylabel(axTr, sprintf('A%d', i), "FontSize", 12, "FontWeight", "bold");
+        ylabel(axTr, sprintf('Feature%d ', i), "FontSize", 9, "FontWeight", "bold");
 
         if i == 1
             title(axTr, 'NMF components with behavior onsets', 'FontSize', 13);
         end
 
-        if i < k
-            set(axTr, 'XTickLabel', []);
-        else
-            xlabel(axTr, 'Time (s)', 'FontSize', 12, 'FontWeight', 'bold');
-        end
+        % if i < k
+        %     set(axTr, 'XTickLabel', []);
+        % else
+        %     xlabel(axTr, 'Time (s)', 'FontSize', 12, 'FontWeight', 'bold');
+        % end
+        xlabel(axTr, 'Time (s)', 'FontSize', 12, 'FontWeight', 'bold');
+
 
         box(axTr, 'off');
     end
 
-    % Single legend using dummy lines (attach to first trace axis, not image axes)
+    % ---- ONE shared colorbar for all spatial tiles (R2023a; DO NOT use colorbar(tl)) ----
+    if hasSpatial
+        cb = colorbar(imgAxes(1));   % attach to an axes (valid syntax)
+        cb.Layout.Tile = 'west';     % dock to the tiledlayout
+        cb.Label.String = 'Spatial weight';
+    end
+
+    % ---- Single legend using dummy lines (attach to first trace axis, not image axes) ----
     axForLegend = traceAxes(1);
     hold(axForLegend, 'on');
     dummy = gobjects(1, nb);
