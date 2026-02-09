@@ -4,18 +4,19 @@ clc
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\scalable_calcium_model_prev'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 %%
-AQuA2_file_suffix = "ManualMoco_cropped_AQuA2"; % "ManualMoco_cropped_AQuA2" for CCK; "moco_cropped_AQuA2" for astrocyte
+% AQuA2_file_suffix = "ManualMoco_cropped_AQuA2"; % for cck
+AQuA2_file_suffix = "moco_cropped_AQuA2"; % for astrocyte
 
-% For the CCK neuronal data
-AQuA2_result_path = "D:\Mouse_behavior_data\D21\AQuA2";
-Ethogram_scoring_path = "D:\Mouse_behavior_data\D21\EthogramScoring";
+% % For the CCK neuronal data
+% AQuA2_result_path = "D:\Mouse_behavior_data\D21\AQuA2";
+% Ethogram_scoring_path = "D:\Mouse_behavior_data\D21\EthogramScoring";
 
 % For the GGP data, various mice, various days
-% mouse_num = 2;
-% day = 28;
-% 
-% AQuA2_result_path = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day));
-% Ethogram_scoring_path = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\EthogramScoring");
+mouse_num = 2;
+day = 21;
+
+AQuA2_result_path = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day));
+Ethogram_scoring_path = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\EthogramScoring");
 
 % For all recordings
 [dF1, datOrg1, evt_map, subset_cutting_points, early_reaction_regions] = concat_videos(AQuA2_result_path, AQuA2_file_suffix);
@@ -141,15 +142,15 @@ if min(X_dFF(:)) < 0
 end
 
 % save preprocessed dF and datOrg
-savefile = "D:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat";
-save(savefile, "dF1_downsampled_smoothed", "datOrg1_downsampled_smoothed", ...
-    "ethogram_mat_downsampled", "new_subset_cutting_points", "evt_map_downsampled", ...
-    "dFF", "mask_downsampled", "temp_down_factor", "-v7.3");
-
-% savefile = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\downsampled_smoothed_data_all_videos.mat");
+% savefile = "D:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat";
 % save(savefile, "dF1_downsampled_smoothed", "datOrg1_downsampled_smoothed", ...
 %     "ethogram_mat_downsampled", "new_subset_cutting_points", "evt_map_downsampled", ...
 %     "dFF", "mask_downsampled", "temp_down_factor", "-v7.3");
+
+savefile = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\downsampled_smoothed_data_all_videos.mat");
+save(savefile, "dF1_downsampled_smoothed", "datOrg1_downsampled_smoothed", ...
+    "ethogram_mat_downsampled", "new_subset_cutting_points", "evt_map_downsampled", ...
+    "dFF", "mask_downsampled", "temp_down_factor", "-v7.3");
 
 
 %% read the saved data, you can start here

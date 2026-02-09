@@ -5,7 +5,7 @@ addpath(genpath('C:\Users\james\CBIL\Astrocyte\scalable_calcium_model_prev'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 %%
 mouse_num1 = 2;
-mouse_num2 = 8;
+mouse_num2 = 23;
 day = 21;
 savefile1 = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num1), "_d", num2str(day), "\downsampled_smoothed_data_all_videos.mat");
 savefile2 = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num2), "_d", num2str(day), "\downsampled_smoothed_data_all_videos.mat");

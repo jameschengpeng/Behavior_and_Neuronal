@@ -1,12 +1,18 @@
 %% read the behavior scoring, transforming to standard form
 clear;
+clc;
 
 filename = "D:\Astrocyte_data\GGP Behavior Scoring - Uninjected.xlsx";
 mouse_num = 2;
 day = 21;
+
 sheetname = strcat("GGP", num2str(mouse_num), "_day", num2str(day));
+
+
 AQuA2_folder = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day));
+
 ethogram_scoring_folder = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\EthogramScoring");
+
 fps_video = 40;
 fps_behavior_scoring = 26.5;
 behavior_scoring_processing(filename, sheetname, AQuA2_folder, ethogram_scoring_folder, fps_video, fps_behavior_scoring);
@@ -141,7 +147,7 @@ function behavior_scoring_processing(filename, sheetname, AQuA2_folder, ethogram
             ethType   = T{rowIdx, j+2};
 
             % Skip missing triplets
-            if any(isnan([onsetBeh, offsetBeh, ethType]))
+            if any(isnan([onsetBeh, offsetBeh, str2double(ethType)]))
                 continue;
             end
 
