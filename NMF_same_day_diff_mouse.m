@@ -7,10 +7,26 @@ addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 mouse_num1 = 2;
 mouse_num2 = 23;
 day = 21;
-savefile1 = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num1), "_d", num2str(day), "\downsampled_smoothed_data_all_videos.mat");
-savefile2 = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num2), "_d", num2str(day), "\downsampled_smoothed_data_all_videos.mat");
+
+savefile1 = strcat("F:\Astrocyte_data\GGP#", num2str(mouse_num1), "_d", num2str(day), "\downsampled_smoothed_data_all_videos.mat");
+mask_path1 = strcat("F:\Astrocyte_data\GGP#", num2str(mouse_num1), "_d", num2str(day), "\mask.mat");
+
+savefile2 = strcat("F:\Astrocyte_data\GGP#", num2str(mouse_num2), "_d", num2str(day), "\downsampled_smoothed_data_all_videos.mat");
+mask_path2 = strcat("F:\Astrocyte_data\GGP#", num2str(mouse_num2), "_d", num2str(day), "\mask.mat");
+
 data1 = load(savefile1);
 data2 = load(savefile2);
+
+% for the mask, divide by the central vein, which acts like a landmark
+[mask1_upper_half, mask1_lower_half] = preprocess_mask(mask_path1);
+[mask2_upper_half, mask2_lower_half] = preprocess_mask(mask_path2);
+
+% downsample to same shape
+mask1_upper_half = imresize(mask1_upper_half, [size(data1.dF1_downsampled_smoothed, 1), size(data1.dF1_downsampled_smoothed, 2)]);
+mask1_lower_half = imresize(mask1_lower_half, [size(data1.dF1_downsampled_smoothed, 1), size(data1.dF1_downsampled_smoothed, 2)]);
+mask2_upper_half = imresize(mask2_upper_half, [size(data2.dF1_downsampled_smoothed, 1), size(data2.dF1_downsampled_smoothed, 2)]);
+mask2_lower_half = imresize(mask2_lower_half, [size(data2.dF1_downsampled_smoothed, 1), size(data2.dF1_downsampled_smoothed, 2)]);
+
 %%
 X_dFF1 = reshape(data1.dFF, [], size(data1.dFF, 3));
 X_dFF2 = reshape(data2.dFF, [], size(data2.dFF, 3));

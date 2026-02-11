@@ -8,15 +8,15 @@ addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 AQuA2_file_suffix = "moco_cropped_AQuA2"; % for astrocyte
 
 % % For the CCK neuronal data
-% AQuA2_result_path = "D:\Mouse_behavior_data\D21\AQuA2";
-% Ethogram_scoring_path = "D:\Mouse_behavior_data\D21\EthogramScoring";
+% AQuA2_result_path = "F:\Mouse_behavior_data\D21\AQuA2";
+% Ethogram_scoring_path = "F:\Mouse_behavior_data\D21\EthogramScoring";
 
 % For the GGP data, various mice, various days
 mouse_num = 2;
 day = 21;
 
-AQuA2_result_path = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day));
-Ethogram_scoring_path = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\EthogramScoring");
+AQuA2_result_path = strcat("F:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day));
+Ethogram_scoring_path = strcat("F:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\EthogramScoring");
 
 % For all recordings
 [dF1, datOrg1, evt_map, subset_cutting_points, early_reaction_regions] = concat_videos(AQuA2_result_path, AQuA2_file_suffix);
@@ -142,19 +142,19 @@ if min(X_dFF(:)) < 0
 end
 
 % save preprocessed dF and datOrg
-% savefile = "D:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat";
+% savefile = "F:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat";
 % save(savefile, "dF1_downsampled_smoothed", "datOrg1_downsampled_smoothed", ...
 %     "ethogram_mat_downsampled", "new_subset_cutting_points", "evt_map_downsampled", ...
 %     "dFF", "mask_downsampled", "temp_down_factor", "-v7.3");
 
-savefile = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\downsampled_smoothed_data_all_videos.mat");
+savefile = strcat("F:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\downsampled_smoothed_data_all_videos.mat");
 save(savefile, "dF1_downsampled_smoothed", "datOrg1_downsampled_smoothed", ...
     "ethogram_mat_downsampled", "new_subset_cutting_points", "evt_map_downsampled", ...
     "dFF", "mask_downsampled", "temp_down_factor", "-v7.3");
 
 
 %% read the saved data, you can start here
-savefile = "D:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat";
+savefile = "F:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat";
 saved_data = load(savefile);
 dF1_downsampled_smoothed        = saved_data.dF1_downsampled_smoothed;
 datOrg1_downsampled_smoothed    = saved_data.datOrg1_downsampled_smoothed;
@@ -187,7 +187,7 @@ for ii = 1:conn.NumObjects
 end
 imagesc(evt_domain_projection)
 %% 
-k_nmf_comp = 8; % number of components in NMF
+k_nmf_comp = 6; % number of components in NMF
 unmasked_indices = find(mask_downsampled);
 unmasked_X_dFF = X_dFF'; % pixels * time
 unmasked_X_dFF = unmasked_X_dFF(unmasked_indices, :);
@@ -792,7 +792,7 @@ function onsetIdx = plotNMF_withBehaviorOnsets(C, E, Fs, A, imgSize)
             axis(axImg, 'off');
             title(axImg, sprintf('Spatial feature %d', i), 'FontSize', 9, 'FontWeight', 'bold');
 
-            colormap(axImg, "hot");
+            colormap(axImg, "parula");
             set(axImg, 'Color', 'k');   % NaNs appear black
             clim(axImg, climGlobal);     % <<< shared scaling across ALL spatial plots
         end

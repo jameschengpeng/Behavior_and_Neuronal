@@ -2,16 +2,16 @@
 clear;
 clc;
 
-filename = "D:\Astrocyte_data\GGP Behavior Scoring - Uninjected.xlsx";
+filename = "F:\Astrocyte_data\GGP Behavior Scoring - Uninjected.xlsx";
 mouse_num = 2;
 day = 21;
 
 sheetname = strcat("GGP", num2str(mouse_num), "_day", num2str(day));
 
 
-AQuA2_folder = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day));
+AQuA2_folder = strcat("F:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day));
 
-ethogram_scoring_folder = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\EthogramScoring");
+ethogram_scoring_folder = strcat("F:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day), "\EthogramScoring");
 
 fps_video = 40;
 fps_behavior_scoring = 26.5;

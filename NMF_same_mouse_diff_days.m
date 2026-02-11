@@ -7,8 +7,8 @@ addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 mouse_num = 2;
 day1 = 21;
 day2 = 28;
-savefile1 = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day1), "\downsampled_smoothed_data_all_videos.mat");
-savefile2 = strcat("D:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day2), "\downsampled_smoothed_data_all_videos.mat");
+savefile1 = strcat("F:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day1), "\downsampled_smoothed_data_all_videos.mat");
+savefile2 = strcat("F:\Astrocyte_data\GGP#", num2str(mouse_num), "_d", num2str(day2), "\downsampled_smoothed_data_all_videos.mat");
 data1 = load(savefile1);
 data2 = load(savefile2);
 %%
