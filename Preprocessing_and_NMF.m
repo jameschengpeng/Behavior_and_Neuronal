@@ -185,6 +185,7 @@ for ii = 1:conn.NumObjects
     ind_2d = sub2ind([size(evt_map_downsampled, 1), size(evt_map_downsampled, 2)], xx_select, yy_select);
     evt_domain_projection(ind_2d) = evt_domain_projection(ind_2d) + 1;
 end
+figure
 imagesc(evt_domain_projection)
 %% 
 k_nmf_comp = 6; % number of components in NMF

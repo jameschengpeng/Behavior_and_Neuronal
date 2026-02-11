@@ -27,6 +27,20 @@ unmasked_X_dFF1 = unmasked_X_dFF1(unmasked_indices, :);
 unmasked_X_dFF2 = X_dFF2;
 unmasked_X_dFF2 = unmasked_X_dFF2(unmasked_indices, :);
 
+%%
+evt_domain_projection = zeros(size(data1.evt_map_downsampled, 1), size(data1.evt_map_downsampled, 2));
+conn = bwconncomp(data1.evt_map_downsampled, 6);
+for ii = 1:conn.NumObjects
+    indices = conn.PixelIdxList{ii};
+    [xx, yy, zz] = ind2sub(size(data1.evt_map_downsampled), indices);
+    xx_select = xx(zz==mode(zz));
+    yy_select = yy(zz==mode(zz));
+    ind_2d = sub2ind([size(data1.evt_map_downsampled, 1), size(data1.evt_map_downsampled, 2)], xx_select, yy_select);
+    evt_domain_projection(ind_2d) = evt_domain_projection(ind_2d) + 1;
+end
+figure
+imagesc(evt_domain_projection)
+
 %% constrained NMF
 opts = struct();
 
@@ -93,16 +107,16 @@ opts.printEvery = 10;
 
 new_height = size(data1.datOrg1_downsampled_smoothed, 1);
 new_width = size(data1.datOrg1_downsampled_smoothed, 2);
-
+%%
 [A, C1, info] = custom_cnmf(X_dFF1, new_height, new_width, k_nmf_comp, combined_mask, opts);
 
 norm(A(unmasked_indices, :) * C1 + info.B(unmasked_indices, :) * info.F - unmasked_X_dFF1, 'fro') / norm(unmasked_X_dFF1, 'fro')
 % Visualize component k footprint
 ethogram_mat1 = data1.ethogram_mat_downsampled;
-plotNMF_withBehaviorOnsets(C1, ethogram_mat1', 40/data1.temp_down_factor, A, [new_height, new_width])
+C1_augmented = [C1; info.F];
+A_augmented = [A info.B];
+plotNMF_withBehaviorOnsets(C1_augmented, ethogram_mat1', 40/data1.temp_down_factor, A_augmented, [new_height, new_width])
 
-figure
-imagesc(reshape(info.B(:,1), [new_height, new_width]))
 
 %% use the A and B to infer C and F
 [C2, F] = estimate_CF_from_fixed_AB(X_dFF2, A, info.B);
@@ -374,9 +388,9 @@ function onsetIdx = plotNMF_withBehaviorOnsets(C, E, Fs, A, imgSize)
 
             axis(axImg, 'image');
             axis(axImg, 'off');
-            title(axImg, sprintf('A %d', i), 'FontSize', 9, 'FontWeight', 'bold');
+            title(axImg, sprintf('Spatial feature %d', i), 'FontSize', 9, 'FontWeight', 'bold');
 
-            colormap(axImg, "hot");
+            colormap(axImg, "parula");
             set(axImg, 'Color', 'k');   % NaNs appear black
             clim(axImg, climGlobal);     % <<< shared scaling across ALL spatial plots
         end
@@ -407,7 +421,7 @@ function onsetIdx = plotNMF_withBehaviorOnsets(C, E, Fs, A, imgSize)
             end
         end
 
-        ylabel(axTr, sprintf('A%d', i), "FontSize", 12, "FontWeight", "bold");
+        ylabel(axTr, sprintf('Feature%d ', i), "FontSize", 9, "FontWeight", "bold");
 
         if i == 1
             title(axTr, 'NMF components with behavior onsets', 'FontSize', 13);
@@ -442,4 +456,7 @@ function onsetIdx = plotNMF_withBehaviorOnsets(C, E, Fs, A, imgSize)
     end
     legend(axForLegend, dummy, behaviorNames, 'Location', 'eastoutside');
 end
+
+
+
 

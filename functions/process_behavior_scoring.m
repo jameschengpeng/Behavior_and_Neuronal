@@ -1,7 +1,7 @@
 %% read the behavior scoring, transforming to standard form
 clear;
 clc;
-
+%%
 filename = "F:\Astrocyte_data\GGP Behavior Scoring - Uninjected.xlsx";
 mouse_num = 2;
 day = 21;
@@ -146,8 +146,11 @@ function behavior_scoring_processing(filename, sheetname, AQuA2_folder, ethogram
             offsetBeh = T{rowIdx, j+1};
             ethType   = T{rowIdx, j+2};
 
+            if ischar(ethType) || isstring(ethType)
+                ethType = str2double(ethType);
+            end
             % Skip missing triplets
-            if any(isnan([onsetBeh, offsetBeh, str2double(ethType)]))
+            if any(isnan([onsetBeh, offsetBeh, ethType]))
                 continue;
             end
 
@@ -182,12 +185,12 @@ function behavior_scoring_processing(filename, sheetname, AQuA2_folder, ethogram
         outFile = fullfile(ethogram_scoring_folder, sprintf("data%02d.xlsx", dataNum));
         writetable(outT, outFile, "FileType", "spreadsheet");
 
-        % ---- Highlight 1's (Windows + Excel required)
-        try
-            highlightOnesInExcel(outFile);
-        catch ME
-            warning("Wrote %s but could not apply highlighting (Excel automation failed): %s", outFile, ME.message);
-        end
+        % % ---- Highlight 1's (Windows + Excel required)
+        % try
+        %     highlightOnesInExcel(outFile);
+        % catch ME
+        %     warning("Wrote %s but could not apply highlighting (Excel automation failed): %s", outFile, ME.message);
+        % end
 
         fprintf("Wrote %s (nFrames=%d) from %s\n", outFile, nFramesVideo, matName);
     end
