@@ -6,13 +6,13 @@ function Z = nmf_behavior_onset_zscore(C, ethogram_mat, fps, preSec, postSec)
 %
 % Inputs:
 %   C            : K x T temporal components
-%   ethogram_mat : T x 9 binary ethogram matrix
+%   ethogram_mat : T x n_beh binary ethogram matrix
 %   fps          : frame rate (Hz)
 %   preSec       : seconds BEFORE onset (default = 2)
 %   postSec      : seconds AFTER onset  (default = 0)
 %
 % Output:
-%   Z            : K x 9 matrix of Z-scores
+%   Z            : K x n_beh matrix of Z-scores
 
 % ---------------- defaults ----------------
 if nargin < 4 || isempty(preSec)
@@ -31,7 +31,7 @@ minOnsets    = 3;     % minimum valid onsets required
 [K, T] = size(C);
 
 if size(ethogram_mat,1) ~= T
-    error('ethogram_mat must be T x 9 with T matching size(C,2).');
+    error('ethogram_mat must be T x n_beh with T matching size(C,2).');
 end
 
 B = ethogram_mat ~= 0;
@@ -45,11 +45,14 @@ winLength = Lpre + Lpost + 1;
 % Exclusion radius for null sampling
 excl = round(exclusionSec * fps);
 
+% Number of behaviors
+n_beh = size(ethogram_mat, 2);
+
 % Output matrix
-Z = nan(K, 9);
+Z = nan(K, n_beh);
 
 % Loop over behaviors
-for b = 1:9
+for b = 1:n_beh
 
     y = B(:, b);
 
