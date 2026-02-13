@@ -5,7 +5,7 @@ addpath(genpath('C:\Users\james\CBIL\Astrocyte\scalable_calcium_model_prev'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 
 %% read the saved data, you can start here
-savefile = "F:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat";
+savefile = "F:\Mouse_behavior_data\D21\AQuA2\downsampled_smoothed_data_all_videos.mat";
 saved_data = load(savefile);
 dF1_downsampled_smoothed        = saved_data.dF1_downsampled_smoothed;
 datOrg1_downsampled_smoothed    = saved_data.datOrg1_downsampled_smoothed;
@@ -17,6 +17,27 @@ dFF                             = saved_data.dFF;
 mask_downsampled                = saved_data.mask_downsampled;
 temp_down_factor                = saved_data.temp_down_factor;
 
+new_height = size(dF1_downsampled_smoothed, 1);
+new_width = size(dF1_downsampled_smoothed, 2);
+
+if isfield(saved_data, 'mask_downsampled_upper') && isfield(saved_data, 'mask_downsampled_lower')
+    mask_downsampled_upper = saved_data.mask_downsampled_upper;
+    mask_downsampled_lower = saved_data.mask_downsampled_lower;
+else
+    mask_path = fullfile(fileparts(savefile), "mask.mat");
+    [mask_upper_half, mask_lower_half] = preprocess_mask(mask_path);
+    
+    mask_downsampled_upper = imresize(mask_upper_half, [new_height, new_width]);
+    mask_downsampled_upper(mask_downsampled_upper < 0.5) = 0;
+    mask_downsampled_upper(mask_downsampled_upper >= 0.5) = 1;
+
+    mask_downsampled_lower = imresize(mask_lower_half, [new_height, new_width]);
+    mask_downsampled_lower(mask_downsampled_lower < 0.5) = 0;
+    mask_downsampled_lower(mask_downsampled_lower >= 0.5) = 1;
+
+    save(savefile, "mask_downsampled_upper", "mask_downsampled_lower", '-append');
+end
+
 clear saved_data
 
 X_dFF = reshape(dFF, [], size(dFF, 3));
@@ -25,8 +46,6 @@ if min(X_dFF(:)) < 0
     X_dFF = X_dFF - min(X_dFF(:));  
 end
 
-new_height = size(dF1_downsampled_smoothed, 1);
-new_width = size(dF1_downsampled_smoothed, 2);
 
 %% Project the active areas detected by AQuA2 into 2D plane
 evt_domain_projection = zeros(size(evt_map_downsampled, 1), size(evt_map_downsampled, 2));
@@ -41,68 +60,32 @@ for ii = 1:conn.NumObjects
 end
 imagesc(evt_domain_projection)
 %% 
-k_nmf_comp = 6; % number of components in NMF
+k_nmf_comp = 3; % number of components in NMF
 unmasked_indices = find(mask_downsampled);
 unmasked_X_dFF = X_dFF'; % pixels * time
 unmasked_X_dFF = unmasked_X_dFF(unmasked_indices, :);
 
-%% vanilla NMF from matlab's built-in function. Set options for NNMF
-opt = statset('nnmf');
-opt.MaxIter = 1000;
-opt.Display = 'final';
-opt.TolFun  = 1e-6;
-opt.TolX    = 1e-6;
-
-% Run NNMF with multiple replicates (non-convex => helps stability)
-% W for spatial components, H for time courses
-[W, H, D] = nnmf(unmasked_X_dFF, k_nmf_comp, ...
-    'Algorithm', 'als', ...     % try 'mult' if you want
-    'Replicates', 5, ...       % increase (15–20) if components vary across runs
-    'Options', opt);
-
-% recover to the full picture
-W_full = zeros([size(X_dFF,2), k_nmf_comp]);
-W_full(unmasked_indices, :) = W;
-
-% Reshape spatial components back to image dimensions (height × width × k_nmf_comp)
-spatial_components = reshape(W_full, [new_height, new_width, k_nmf_comp]);
-
-% Temporal traces (k_nmf_comp × T)
-temporal_traces = H;
-
-norm(W * H - unmasked_X_dFF) / norm(unmasked_X_dFF)
-
-ethogram_mat = ethogram_mat_downsampled((select_start+1):select_end, :);
-plotNMF_withBehaviorOnsets(H, ethogram_mat', 40/temp_down_factor, W_full, [new_height, new_width])
-
-%%
-ethogram_mat = ethogram_mat > 0.5;
-Z = nmf_behavior_onset_zscore(C, ethogram_mat, 40/temp_down_factor, 2, 2);  % returns K x 9
-Z(Z < 2) = -10;
-figure
-imagesc(Z)
-
 %% constrained NMF
 opts = struct();
-opts.quiet_prctile = 20;
+opts.quiet_prctile = 10;
 % =====================
 % Iteration / stopping
 % =====================
 opts.maxIter   = 150;
 opts.minIter   = 60;
-opts.tol       = 1e-5;
+opts.tol       = 0.01;
 
 % =====================
 % Spatial penalties
 % =====================
-opts.lambdaA_L1   = 1e-6;     % VERY weak sparsity (astrocytes are diffuse)
+opts.lambdaA_L1   = 1e-1;     % sparcity constraint
 opts.lambdaA_lap  = 5e-4;     % smooth contiguous regions
-opts.lambdaA_excl = 0;        % OFF initially (overlap is allowed)
+opts.lambdaA_excl = 1e-5;        % OFF initially (overlap is allowed)
 
 % =====================
 % Temporal penalty
 % =====================
-opts.lambdaC_smooth = 1e-3;   % smooth calcium dynamics
+opts.lambdaC_smooth = 1e-2;   % smooth calcium dynamics
 opts.lambdaF_smooth = 1e-2;
 
 % =====================
@@ -149,13 +132,27 @@ opts.printEvery = 10;
 n_video_train = 10;
 T_train = new_subset_cutting_points(n_video_train+1);
 
-[A, C_train, info_train] = custom_cnmf(X_dFF(1:T_train, :)', new_height, new_width, k_nmf_comp, mask_downsampled, opts);
-%% Use the pre-fitted A and B matrices to figure out the remaining time course
-B = info_train.B;
-[C_test, F_test, info_test] = infer_CF_fixed_AB(X_dFF(T_train+1:end, :)', A, B, new_height, new_width, mask_downsampled, opts);
+[A_upper, C_upper_train, info_upper_train] = custom_cnmf(X_dFF(1:T_train, :)', new_height, new_width, k_nmf_comp, mask_downsampled_upper, opts);
+[A_lower, C_lower_train, info_lower_train] = custom_cnmf(X_dFF(1:T_train, :)', new_height, new_width, k_nmf_comp, mask_downsampled_lower, opts);
 
+% Use the pre-fitted A and B matrices to figure out the remaining time course
+B_upper = info_upper_train.B;
+[C_upper_test, F_upper_test, info_upper_test] = infer_CF_fixed_AB(X_dFF(T_train+1:end, :)', A_upper, B_upper, new_height, new_width, mask_downsampled_upper, opts);
+
+B_lower = info_lower_train.B;
+[C_lower_test, F_lower_test, info_lower_test] = infer_CF_fixed_AB(X_dFF(T_train+1:end, :)', A_lower, B_lower, new_height, new_width, mask_downsampled_lower, opts);
+
+% append the upper and lower halves
+A = [A_upper A_lower];
+B = [B_upper B_lower];
+
+C_train = [C_upper_train; C_lower_train];
+C_test =  [C_upper_test; C_lower_test];
 C = [C_train C_test];
-F = [info_train.F F_test];
+
+F_train = [info_upper_train.F; info_lower_train.F];
+F_test = [F_upper_test; F_lower_test];
+F = [F_train F_test];
 
 norm(A(unmasked_indices, :) * C + B(unmasked_indices, :) * F - unmasked_X_dFF, 'fro') / norm(unmasked_X_dFF, 'fro')
 % Visualize component k footprint
@@ -188,6 +185,43 @@ xlabel("Behavior type", 'FontSize', 12, 'FontWeight','bold');
 ylabel("NMF component number", 'FontSize', 12, 'FontWeight','bold');
 title("Z-score", 'FontSize', 12, 'FontWeight','bold')
 colorbar
+
+
+%% vanilla NMF from matlab's built-in function. Set options for NNMF
+opt = statset('nnmf');
+opt.MaxIter = 1000;
+opt.Display = 'final';
+opt.TolFun  = 1e-6;
+opt.TolX    = 1e-6;
+
+% Run NNMF with multiple replicates (non-convex => helps stability)
+% W for spatial components, H for time courses
+[W, H, D] = nnmf(unmasked_X_dFF, k_nmf_comp, ...
+    'Algorithm', 'als', ...     % try 'mult' if you want
+    'Replicates', 5, ...       % increase (15–20) if components vary across runs
+    'Options', opt);
+
+% recover to the full picture
+W_full = zeros([size(X_dFF,2), k_nmf_comp]);
+W_full(unmasked_indices, :) = W;
+
+% Reshape spatial components back to image dimensions (height × width × k_nmf_comp)
+spatial_components = reshape(W_full, [new_height, new_width, k_nmf_comp]);
+
+% Temporal traces (k_nmf_comp × T)
+temporal_traces = H;
+
+norm(W * H - unmasked_X_dFF) / norm(unmasked_X_dFF)
+
+ethogram_mat = condensed_ethogram_mat_downsampled((select_start+1):select_end, :);
+plotNMF_withBehaviorOnsets(H, ethogram_mat', 40/temp_down_factor, W_full, [new_height, new_width])
+
+ethogram_mat = ethogram_mat > 0.5;
+Z = nmf_behavior_onset_zscore(C, ethogram_mat, 40/temp_down_factor, 2, 2);  % returns K x 9
+Z(Z < 2) = -10;
+figure
+imagesc(Z)
+
 
 %% Train / test evaluation for vanilla NMF (time-split CV)
 
