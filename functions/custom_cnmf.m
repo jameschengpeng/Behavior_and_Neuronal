@@ -278,6 +278,8 @@ for it = 1:opts.maxIter
     end
     prevObj = obj;
 
+    % Print the loss, the norms of A and C, and the contributions of
+    % different terms to the gradient
     if opts.verbose && (mod(it, opts.printEvery) == 0 || it == 1)
     
         % ---- Gradient contribution diagnostics (A-update)
@@ -315,6 +317,7 @@ for it = 1:opts.maxIter
                 it, obj, relRecon, norm(Aact,'fro'), nnz(Aact), norm(C,'fro'), opts.use_background, ...
                 norm(grad_fit,'fro'), norm(grad_lap,'fro'), norm(grad_excl,'fro'), ...
                 l1_obj, l1_shrink, etaA);
+        disp(' ')
     end
 
 
