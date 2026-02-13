@@ -78,9 +78,9 @@ opts.tol       = 0.01;
 % =====================
 % Spatial penalties
 % =====================
-opts.lambdaA_L1   = 1e-1;     % sparcity constraint
-opts.lambdaA_lap  = 5e-4;     % smooth contiguous regions
-opts.lambdaA_excl = 1e-5;        % OFF initially (overlap is allowed)
+opts.lambdaA_L1   = 1;     % sparcity constraint
+opts.lambdaA_lap  = 1e3;     % smooth contiguous regions
+opts.lambdaA_excl = 1e2;        % OFF initially (overlap is allowed)
 
 % =====================
 % Temporal penalty

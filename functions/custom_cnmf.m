@@ -279,9 +279,45 @@ for it = 1:opts.maxIter
     prevObj = obj;
 
     if opts.verbose && (mod(it, opts.printEvery) == 0 || it == 1)
-        fprintf('Iter %4d | obj %.4e | relRecon %.4g | ||A|| %.3e nnzA %d | ||C|| %.3e | bg %d\n', ...
-            it, obj, relRecon, norm(Aact,'fro'), nnz(Aact), norm(C,'fro'), opts.use_background);
+    
+        % ---- Gradient contribution diagnostics (A-update)
+        Rtmp = (Aact*C + B*F) - X;
+        grad_fit = (Rtmp * C');
+    
+        grad_lap = zeros(size(Aact));
+        if opts.lambdaA_lap > 0
+            grad_lap = opts.lambdaA_lap * (L * Aact);
+        end
+    
+        grad_excl = zeros(size(Aact));
+        if opts.lambdaA_excl > 0
+            sumA = sum(Aact, 2);
+            grad_excl = opts.lambdaA_excl * ((sumA * ones(1,K)) - Aact);
+        end
+    
+        % ---- L1 diagnostics
+        l1_obj = opts.lambdaA_L1 * sum(Aact(:));  % objective L1 term
+    
+        % Proximal shrinkage size (how much L1 is actually changing A)
+        Atemp = Aact - etaA * (grad_fit + grad_lap + grad_excl);
+    
+        if opts.lambdaA_L1 > 0
+            Aprox = soft_thresh_nonneg(Atemp, etaA * opts.lambdaA_L1);
+        else
+            Aprox = max(Atemp, 0);
+        end
+    
+        l1_shrink = norm(Atemp - Aprox, 'fro');
+    
+        fprintf(['Iter %4d | obj %.4e | relRecon %.4g | ||A|| %.3e nnzA %d | ||C|| %.3e | bg %d\n' ...
+                 '   GradA norms: fit %.3e | lap %.3e | excl %.3e\n' ...
+                 '   L1: objTerm %.3e | proxShrink(Fro) %.3e | etaA %.3e\n'], ...
+                it, obj, relRecon, norm(Aact,'fro'), nnz(Aact), norm(C,'fro'), opts.use_background, ...
+                norm(grad_fit,'fro'), norm(grad_lap,'fro'), norm(grad_excl,'fro'), ...
+                l1_obj, l1_shrink, etaA);
     end
+
+
 
     % stopping
     if it >= opts.minIter && it > 1 && info.relchg(it) < opts.tol
