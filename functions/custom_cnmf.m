@@ -20,9 +20,6 @@ function [A, C, info] = custom_cnmf(X_dFF, H, W, K, mask, evt_domain_projection,
 if nargin < 6, opts = struct(); end
 opts = set_default_opts(opts);
 
-g2d = evt_domain_projection .* mask; % keep only the unmasked regions
-
-
 [P, T] = size(X_dFF);
 assert(P == H*W, 'X_dFF must have P=H*W rows.');
 mask = reshape(mask, [], 1) ~= 0;
@@ -32,6 +29,14 @@ assert(numel(mask) == P, 'mask must be HxW or P-vector.');
 idx = find(mask);
 Pm  = numel(idx);
 Xraw = double(X_dFF(idx, :));
+
+% use the AQuA2 detected events' projection as a guide to CNMF
+guide_full = reshape(evt_domain_projection, [], 1);
+guide_act  = double(guide_full(idx));
+guide_act  = guide_act / (max(guide_act) + eps);  % normalize to [0,1]
+
+
+
 
 % Nonnegativity handling for X (IMPORTANT: avoid double-shifting)
 X = Xraw;
