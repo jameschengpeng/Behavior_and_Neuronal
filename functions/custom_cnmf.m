@@ -1,4 +1,4 @@
-function [A, C, info] = custom_cnmf(X_dFF, H, W, K, mask, opts, evt_domain_projection)
+function [A, C, info] = custom_cnmf(X_dFF, H, W, K, mask, evt_domain_projection, opts)
 %CUSTOM_CNMF  CNMF-like factorization with OPTIONAL rank-1 background.
 %
 % Model (active pixels only):

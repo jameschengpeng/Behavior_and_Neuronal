@@ -156,8 +156,8 @@ n_video_train = 10;
 T_train = new_subset_cutting_points(n_video_train+1);
 
 
-[A_upper, C_upper_train, info_upper_train] = custom_cnmf(X_dFF(1:T_train, :)', new_height, new_width, k_nmf_comp, mask_downsampled_upper, opts, evt_domain_projection);
-[A_lower, C_lower_train, info_lower_train] = custom_cnmf(X_dFF(1:T_train, :)', new_height, new_width, k_nmf_comp, mask_downsampled_lower, opts, evt_domain_projection);
+[A_upper, C_upper_train, info_upper_train] = custom_cnmf(X_dFF(1:T_train, :)', new_height, new_width, k_nmf_comp, mask_downsampled_upper, evt_domain_projection, opts);
+[A_lower, C_lower_train, info_lower_train] = custom_cnmf(X_dFF(1:T_train, :)', new_height, new_width, k_nmf_comp, mask_downsampled_lower, evt_domain_projection, opts);
 
 % Use the pre-fitted A and B matrices to figure out the remaining time course
 B_upper = info_upper_train.B;
