@@ -161,13 +161,13 @@ for it = 1:opts.maxIter
 
         if opts.backtracking
             % backtrack if objective increases
-            [objOld] = objective_val(X, Aact, C, B, F, L, DtD, opts);
-            [objNew] = objective_val(X, Aact, Cnew, B, F, L, DtD, opts);
+            [objOld] = objective_val(X, Aact, C, B, F, L, DtD, opts, guide_act);
+            [objNew] = objective_val(X, Aact, Cnew, B, F, L, DtD, opts, guide_act);
             bt = 0;
             while objNew > objOld && bt < opts.maxBacktrack
                 etaC = etaC * 0.5;
                 Cnew = max(0, C - etaC * gradC);
-                objNew = objective_val(X, Aact, Cnew, B, F, L, DtD, opts);
+                objNew = objective_val(X, Aact, Cnew, B, F, L, DtD, opts, guide_act);
                 bt = bt + 1;
             end
         end
@@ -242,6 +242,24 @@ for it = 1:opts.maxIter
             gradA = gradA + opts.lambdaA_excl * gradExcl;
         end
 
+        % ---- Guide penalty (match sum of A to AQuA2 projection)
+        if opts.lambdaA_guide > 0
+            Aact_sum = sum(Aact, 2);                 % Pm x 1
+            g = guide_act;                    % Pm x 1 (already masked)
+            
+            if opts.use_guide_scale
+                beta = (g' * Aact_sum) / (g' * g + opts.guide_eps);
+            else
+                beta = 1;
+            end
+            
+            r = Aact_sum - beta * g;                 % Pm x 1
+            gradGuide = opts.lambdaA_guide * (r * ones(1,K));
+            
+            gradA = gradA + gradGuide;
+        end
+
+
         Anew = Aact - etaA * gradA;
 
         if opts.lambdaA_L1 > 0
@@ -251,8 +269,8 @@ for it = 1:opts.maxIter
         end
 
         if opts.backtracking
-            objOld = objective_val(X, Aact, C, B, F, L, DtD, opts);
-            objNew = objective_val(X, Anew, C, B, F, L, DtD, opts);
+            objOld = objective_val(X, Aact, C, B, F, L, DtD, opts, guide_act);
+            objNew = objective_val(X, Anew, C, B, F, L, DtD, opts, guide_act);
             bt = 0;
             while objNew > objOld && bt < opts.maxBacktrack
                 etaA = etaA * 0.5;
@@ -262,7 +280,7 @@ for it = 1:opts.maxIter
                 else
                     Anew = max(Anew, 0);
                 end
-                objNew = objective_val(X, Anew, C, B, F, L, DtD, opts);
+                objNew = objective_val(X, Anew, C, B, F, L, DtD, opts, guide_act);
                 bt = bt + 1;
             end
         end
@@ -276,7 +294,7 @@ for it = 1:opts.maxIter
     end
 
     % ---- Diagnostics
-    obj = objective_val(X, Aact, C, B, F, L, DtD, opts);
+    obj = objective_val(X, Aact, C, B, F, L, DtD, opts, guide_act);
     info.obj(it) = obj;
 
     relRecon = norm(X - (Aact*C + B*F), 'fro')^2 / (norm(X,'fro')^2 + eps);
@@ -346,6 +364,24 @@ for it = 1:opts.maxIter
             end
         end
     
+        % AQuA2 guide diagnostics
+        grad_guide = zeros(size(Aact));
+        guide_obj = 0;
+        
+        if opts.lambdaA_guide > 0
+            Aact_sum = sum(Aact,2);
+            g = guide_act;
+            if opts.use_guide_scale
+                beta = (g' * Aact_sum) / (g' * g + opts.guide_eps);
+            else
+                beta = 1;
+            end
+            r = Aact_sum - beta*g;
+            grad_guide = opts.lambdaA_guide * (r * ones(1,K));
+            guide_obj = 0.5 * opts.lambdaA_guide * (r' * r);
+        end
+
+
         % =========================
         % ---- Print ----
         % =========================
@@ -353,11 +389,13 @@ for it = 1:opts.maxIter
                  '   A-grad:  fit %.3e | lap %.3e | excl %.3e | L1obj %.3e | prox %.3e | tau %.3e\n' ...
                  '   C-grad:  fit %.3e | smooth %.3e\n' ...
                  '   F-grad:  fit %.3e | smooth %.3e\n'], ...
+                 '   Guide    %.3e', ...
                 it, obj, relRecon, norm(Aact,'fro'), nnz(Aact), norm(C,'fro'), opts.use_background, ...
                 norm(gradA_fit,'fro'), norm(gradA_lap,'fro'), norm(gradA_excl,'fro'), ...
                 l1_obj, l1_shrink, tau, ...
                 norm(gradC_fit,'fro'), norm(gradC_smooth,'fro'), ...
-                norm(gradF_fit,'fro'), norm(gradF_smooth,'fro'));
+                norm(gradF_fit,'fro'), norm(gradF_smooth,'fro'), ...
+                norm(grad_guide, 'fro'));
         disp('-----------')
     end
 
@@ -494,6 +532,11 @@ def.quiet_prctile = 20;
 def.n_refine = 1;
 def.nonneg_mode = "none"; % safest for dF/F init
 def.eps0 = 1e-12;
+% the guide from AQuA2 events' projections
+def.lambdaA_guide = 0;        % guide strength (OFF by default)
+def.use_guide_scale = true;   % compute beta each iter
+def.guide_eps = 1e-12;
+
 
 f = fieldnames(def);
 for i = 1:numel(f)
@@ -561,7 +604,7 @@ function opts = set_default_opts(opts)
     end
 end
 
-function obj = objective_val(X, A, C, B, F, L, DtD, opts)
+function obj = objective_val(X, A, C, B, F, L, DtD, opts, guide_act)
     R = X - (A*C + B*F);
     fitTerm = 0.5 * (norm(R,'fro')^2);
 
@@ -588,7 +631,22 @@ function obj = objective_val(X, A, C, B, F, L, DtD, opts)
         smoothFTerm = 0.5 * opts.lambdaF_smooth * trace(F * (DtD * F'));
     end
 
-    obj = fitTerm + lapTerm + l1Term + exclTerm + smoothCTerm + smoothFTerm;
+    guideTerm = 0;
+    if opts.lambdaA_guide > 0
+        s = sum(A,2);
+        g = guide_act;   % must be accessible (see note below)
+        
+        if opts.use_guide_scale
+            beta = (g' * s) / (g' * g + opts.guide_eps);
+        else
+            beta = 1;
+        end
+        
+        r = s - beta * g;
+        guideTerm = 0.5 * opts.lambdaA_guide * (r' * r);
+    end
+
+    obj = fitTerm + lapTerm + l1Term + exclTerm + smoothCTerm + smoothFTerm + guideTerm;
 end
 
 function DtD = build_DtD(T)

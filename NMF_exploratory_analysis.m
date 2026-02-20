@@ -104,6 +104,7 @@ opts.tol       = 0.01;
 opts.lambdaA_L1   = 1;     % sparcity constraint
 opts.lambdaA_lap  = 100;     % smooth contiguous regions
 opts.lambdaA_excl = 100;        % OFF initially (overlap is allowed)
+opts.lambdaA_guide = 1;
 
 % =====================
 % Temporal penalty
