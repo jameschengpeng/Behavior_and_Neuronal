@@ -48,19 +48,42 @@ end
 
 
 %% Project the active areas detected by AQuA2 into 2D plane
-evt_domain_projection = zeros(size(evt_map_downsampled, 1), size(evt_map_downsampled, 2));
+
+evt_domain_projection = zeros(new_height, new_width);
 conn = bwconncomp(evt_map_downsampled, 6);
+% for ii = 1:conn.NumObjects
+%     indices = conn.PixelIdxList{ii};
+%     [xx, yy, zz] = ind2sub(size(evt_map_downsampled), indices);
+%     xx_select = xx(zz==mode(zz));
+%     yy_select = yy(zz==mode(zz));
+%     ind_2d = sub2ind([size(evt_map_downsampled, 1), size(evt_map_downsampled, 2)], xx_select, yy_select);
+%     if numel(ind_2d) < 0.1 * size(evt_map_downsampled, 1) * size(evt_map_downsampled, 2)
+%         evt_domain_projection(ind_2d) = evt_domain_projection(ind_2d) + 1;
+%     end
+% end
 for ii = 1:conn.NumObjects
     indices = conn.PixelIdxList{ii};
     [xx, yy, zz] = ind2sub(size(evt_map_downsampled), indices);
-    xx_select = xx(zz==mode(zz));
-    yy_select = yy(zz==mode(zz));
-    ind_2d = sub2ind([size(evt_map_downsampled, 1), size(evt_map_downsampled, 2)], xx_select, yy_select);
-    evt_domain_projection(ind_2d) = evt_domain_projection(ind_2d) + 1;
+    xx_select = xx(zz==mode(zz)); % the largest spatial domain of this evt
+    yy_select = yy(zz==mode(zz)); % the largest spatial domain of this evt
+    ind_2d = sub2ind([new_height, new_width], xx_select, yy_select);
+    if numel(ind_2d) < 0.1 * new_height * new_width
+        subs = [xx(:) yy(:)];  % N-by-2, rows are (row,col)
+        evt_domain_projection = evt_domain_projection + accumarray( ...
+            subs, 1, size(evt_domain_projection), @sum, 0);
+    end
 end
+evt_domain_projection(evt_domain_projection == 0) = NaN;
+figure
 imagesc(evt_domain_projection)
+cmap = parula(256);
+cmap(1,:) = [0 0 0];  % make first color black
+colormap(cmap)
+
+clim([min(evt_domain_projection(isfinite(evt_domain_projection))) max(evt_domain_projection(isfinite(evt_domain_projection)))])  % ignore NaNs for scaling
+colorbar
 %% 
-k_nmf_comp = 3; % number of components in NMF
+k_nmf_comp = 4; % number of components in NMF
 unmasked_indices = find(mask_downsampled);
 unmasked_X_dFF = X_dFF'; % pixels * time
 unmasked_X_dFF = unmasked_X_dFF(unmasked_indices, :);
@@ -72,21 +95,21 @@ opts.quiet_prctile = 10;
 % Iteration / stopping
 % =====================
 opts.maxIter   = 150;
-opts.minIter   = 60;
+opts.minIter   = 10;
 opts.tol       = 0.01;
 
 % =====================
 % Spatial penalties
 % =====================
 opts.lambdaA_L1   = 1;     % sparcity constraint
-opts.lambdaA_lap  = 1e3;     % smooth contiguous regions
-opts.lambdaA_excl = 1e2;        % OFF initially (overlap is allowed)
+opts.lambdaA_lap  = 100;     % smooth contiguous regions
+opts.lambdaA_excl = 100;        % OFF initially (overlap is allowed)
 
 % =====================
 % Temporal penalty
 % =====================
-opts.lambdaC_smooth = 1e-2;   % smooth calcium dynamics
-opts.lambdaF_smooth = 1e-2;
+opts.lambdaC_smooth = 1e-1;   % smooth calcium dynamics
+opts.lambdaF_smooth = 1e-1;
 
 % =====================
 % Step sizes / solver
@@ -132,8 +155,9 @@ opts.printEvery = 10;
 n_video_train = 10;
 T_train = new_subset_cutting_points(n_video_train+1);
 
-[A_upper, C_upper_train, info_upper_train] = custom_cnmf(X_dFF(1:T_train, :)', new_height, new_width, k_nmf_comp, mask_downsampled_upper, opts);
-[A_lower, C_lower_train, info_lower_train] = custom_cnmf(X_dFF(1:T_train, :)', new_height, new_width, k_nmf_comp, mask_downsampled_lower, opts);
+
+[A_upper, C_upper_train, info_upper_train] = custom_cnmf(X_dFF(1:T_train, :)', new_height, new_width, k_nmf_comp, mask_downsampled_upper, opts, evt_domain_projection);
+[A_lower, C_lower_train, info_lower_train] = custom_cnmf(X_dFF(1:T_train, :)', new_height, new_width, k_nmf_comp, mask_downsampled_lower, opts, evt_domain_projection);
 
 % Use the pre-fitted A and B matrices to figure out the remaining time course
 B_upper = info_upper_train.B;
@@ -163,6 +187,32 @@ ethogram_mat = condensed_ethogram_mat_downsampled;
 C_augmented = [C; F];
 A_augmented = [A B];
 plotNMF_withBehaviorOnsets(C_augmented, ethogram_mat', 40/temp_down_factor, A_augmented, [new_height, new_width])
+
+%%
+X = C';
+[T,n] = size(X);
+maxLag = 20;
+L = 2*maxLag + 1;
+
+R = zeros(L,n,n);
+
+for i = 1:n
+    for j = 1:n
+        R(:,i,j) = xcorr(X(:,i), X(:,j), maxLag, 'coeff');
+    end
+end
+
+lags = (-maxLag:maxLag)';  % lag vector
+
+maxCorr = zeros(n,n);
+bestLag = zeros(n,n);
+
+for i = 1:n
+    for j = 1:n
+        [maxCorr(i,j), idx] = max(R(:,i,j));
+        bestLag(i,j) = lags(idx);
+    end
+end
 
 %% obtain the z-score map
 % for each behavior and each NMF component, we extract the relevant time

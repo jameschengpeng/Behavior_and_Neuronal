@@ -1,4 +1,4 @@
-function [A, C, info] = custom_cnmf(X_dFF, H, W, K, mask, opts)
+function [A, C, info] = custom_cnmf(X_dFF, H, W, K, mask, opts, evt_domain_projection)
 %CUSTOM_CNMF  CNMF-like factorization with OPTIONAL rank-1 background.
 %
 % Model (active pixels only):
@@ -19,6 +19,9 @@ function [A, C, info] = custom_cnmf(X_dFF, H, W, K, mask, opts)
 
 if nargin < 6, opts = struct(); end
 opts = set_default_opts(opts);
+
+g2d = evt_domain_projection .* mask; % keep only the unmasked regions
+
 
 [P, T] = size(X_dFF);
 assert(P == H*W, 'X_dFF must have P=H*W rows.');
@@ -84,7 +87,10 @@ end
 Aact = max(0, U * sqrt(S));
 C    = max(0, (sqrt(S) * V'));
 
-
+% this block is for checking the initialization of spatial footprints
+A_init = zeros(size(mask, 1), K);
+A_init(idx, :) = Aact;
+A_init_comb = reshape(sum(A_init, 2), [H, W]);
 
 % Reinit any dead components
 for k = 1:K
@@ -145,9 +151,7 @@ for it = 1:opts.maxIter
         % grad wrt C: A'*(A*C + B*F - X) + lambdaC*(C*DtD)
         R = (Aact*C + B*F) - X;
         gradC = (Aact' * R) + opts.lambdaC_smooth * (C * DtD);
-        if it == 30
-            disp(1)
-        end
+
         Cnew = max(0, C - etaC * gradC);
 
         if opts.backtracking
@@ -282,43 +286,76 @@ for it = 1:opts.maxIter
     % different terms to the gradient
     if opts.verbose && (mod(it, opts.printEvery) == 0 || it == 1)
     
-        % ---- Gradient contribution diagnostics (A-update)
+        % =========================
+        % ---- A diagnostics ----
+        % =========================
         Rtmp = (Aact*C + B*F) - X;
-        grad_fit = (Rtmp * C');
     
-        grad_lap = zeros(size(Aact));
+        % Fit gradient
+        gradA_fit = (Rtmp * C');
+    
+        % Laplacian gradient
+        gradA_lap = zeros(size(Aact));
         if opts.lambdaA_lap > 0
-            grad_lap = opts.lambdaA_lap * (L * Aact);
+            gradA_lap = opts.lambdaA_lap * (L * Aact);
         end
     
-        grad_excl = zeros(size(Aact));
+        % Exclusivity gradient
+        gradA_excl = zeros(size(Aact));
         if opts.lambdaA_excl > 0
             sumA = sum(Aact, 2);
-            grad_excl = opts.lambdaA_excl * ((sumA * ones(1,K)) - Aact);
+            gradA_excl = opts.lambdaA_excl * ((sumA * ones(1,size(Aact,2))) - Aact);
         end
     
-        % ---- L1 diagnostics
-        l1_obj = opts.lambdaA_L1 * sum(Aact(:));  % objective L1 term
+        % L1 diagnostics
+        tau = etaA * opts.lambdaA_L1;
+        l1_obj = opts.lambdaA_L1 * sum(Aact(:));
     
-        % Proximal shrinkage size (how much L1 is actually changing A)
-        Atemp = Aact - etaA * (grad_fit + grad_lap + grad_excl);
-    
+        Atemp = Aact - etaA * (gradA_fit + gradA_lap + gradA_excl);
         if opts.lambdaA_L1 > 0
-            Aprox = soft_thresh_nonneg(Atemp, etaA * opts.lambdaA_L1);
+            Aprox = soft_thresh_nonneg(Atemp, tau);
         else
             Aprox = max(Atemp, 0);
         end
-    
         l1_shrink = norm(Atemp - Aprox, 'fro');
     
+        % =========================
+        % ---- C diagnostics ----
+        % =========================
+        gradC_fit = Aact' * Rtmp;
+    
+        gradC_smooth = zeros(size(C));
+        if opts.lambdaC_smooth > 0
+            gradC_smooth = opts.lambdaC_smooth * (C * DtD);
+        end
+    
+        % =========================
+        % ---- F diagnostics ----
+        % =========================
+        gradF_fit = zeros(size(F));
+        gradF_smooth = zeros(size(F));
+        if ~isempty(F)
+            gradF_fit = B' * Rtmp;
+            if opts.lambdaF_smooth > 0
+                gradF_smooth = opts.lambdaF_smooth * (F * DtD);
+            end
+        end
+    
+        % =========================
+        % ---- Print ----
+        % =========================
         fprintf(['Iter %4d | obj %.4e | relRecon %.4g | ||A|| %.3e nnzA %d | ||C|| %.3e | bg %d\n' ...
-                 '   GradA norms: fit %.3e | lap %.3e | excl %.3e\n' ...
-                 '   L1: objTerm %.3e | proxShrink(Fro) %.3e | etaA %.3e\n'], ...
+                 '   A-grad:  fit %.3e | lap %.3e | excl %.3e | L1obj %.3e | prox %.3e | tau %.3e\n' ...
+                 '   C-grad:  fit %.3e | smooth %.3e\n' ...
+                 '   F-grad:  fit %.3e | smooth %.3e\n'], ...
                 it, obj, relRecon, norm(Aact,'fro'), nnz(Aact), norm(C,'fro'), opts.use_background, ...
-                norm(grad_fit,'fro'), norm(grad_lap,'fro'), norm(grad_excl,'fro'), ...
-                l1_obj, l1_shrink, etaA);
-        disp(' ')
+                norm(gradA_fit,'fro'), norm(gradA_lap,'fro'), norm(gradA_excl,'fro'), ...
+                l1_obj, l1_shrink, tau, ...
+                norm(gradC_fit,'fro'), norm(gradC_smooth,'fro'), ...
+                norm(gradF_fit,'fro'), norm(gradF_smooth,'fro'));
+        disp('-----------')
     end
+
 
 
 
