@@ -5,7 +5,7 @@ clc
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\scalable_calcium_model_prev'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 %%
-savefile = "F:\Mouse_behavior_data\D21\downsampled_smoothed_data_all_videos.mat";
+savefile = "F:\Mouse_behavior_data\D21\AQuA2\downsampled_smoothed_data_all_videos.mat";
 saved_data = load(savefile);
 
 new_subset_cutting_points       = saved_data.new_subset_cutting_points;
@@ -35,6 +35,13 @@ for ii = 1:numel(video_num)
     end
     video_len = video_lengths(ii);
 
+    if size(ethogramMatrix, 1) < video_len * temp_down_factor
+        mismatch = video_len * temp_down_factor - size(ethogramMatrix, 1);
+        ethogramMatrix = [ethogramMatrix; zeros(mismatch, size(ethogramMatrix, 2))];
+    elseif size(ethogramMatrix, 1) > video_len * temp_down_factor
+        ethogramMatrix = ethogramMatrix(1:video_len * temp_down_factor, :);
+    end
+
     video_ethogram_temp_down = zeros(video_len, size(ethogramMatrix, 2));
     for jj = 1:video_len
         substart_T = (jj-1) * temp_down_factor + 1; % local index in a video BEFORE temp down-sample
@@ -44,9 +51,13 @@ for ii = 1:numel(video_num)
     start_T = new_subset_cutting_points(ii)+1;
     end_T = new_subset_cutting_points(ii+1);
     condensed_ethogram_mat_downsampled(start_T:end_T, :) = video_ethogram_temp_down;
+    if any(isnan(video_ethogram_temp_down(:)))
+        disp(ii)
+        disp('isnan')
+    end
 end
-
- save(savefile, "condensed_ethogram_mat_downsampled", '-append')
+%%
+save(savefile, "condensed_ethogram_mat_downsampled", '-append')
 
 
 

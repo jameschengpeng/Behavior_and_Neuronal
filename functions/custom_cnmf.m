@@ -17,7 +17,7 @@ function [A, C, info] = custom_cnmf(X_dFF, H, W, K, mask, evt_domain_projection,
 %
 % Inputs unchanged from your original implementation.
 
-if nargin < 6, opts = struct(); end
+if nargin < 7, opts = struct(); end
 opts = set_default_opts(opts);
 
 [P, T] = size(X_dFF);
@@ -223,8 +223,6 @@ for it = 1:opts.maxIter
         F = F .* coln';
     end
 
-
-
     % =========================
     % (3) Update A (prox-grad: fit + lap + excl, then L1+nonneg prox)
     % =========================
@@ -253,8 +251,7 @@ for it = 1:opts.maxIter
                 beta = 1;
             end
             
-            r = Aact_sum - beta * g;                 % Pm x 1
-            gradGuide = opts.lambdaA_guide * (r * ones(1,K));
+            gradGuide = opts.lambdaA_guide * ((Aact_sum - beta * g) * ones(1,K));
             
             gradA = gradA + gradGuide;
         end
@@ -376,9 +373,9 @@ for it = 1:opts.maxIter
             else
                 beta = 1;
             end
-            r = Aact_sum - beta*g;
-            grad_guide = opts.lambdaA_guide * (r * ones(1,K));
-            guide_obj = 0.5 * opts.lambdaA_guide * (r' * r);
+            remainder = Aact_sum - beta*g;
+            grad_guide = opts.lambdaA_guide * (remainder * ones(1,K));
+            guide_obj = 0.5 * opts.lambdaA_guide * (remainder' * remainder);
         end
 
 
@@ -388,14 +385,15 @@ for it = 1:opts.maxIter
         fprintf(['Iter %4d | obj %.4e | relRecon %.4g | ||A|| %.3e nnzA %d | ||C|| %.3e | bg %d\n' ...
                  '   A-grad:  fit %.3e | lap %.3e | excl %.3e | L1obj %.3e | prox %.3e | tau %.3e\n' ...
                  '   C-grad:  fit %.3e | smooth %.3e\n' ...
-                 '   F-grad:  fit %.3e | smooth %.3e\n'], ...
-                 '   Guide    %.3e', ...
+                 '   F-grad:  fit %.3e | smooth %.3e\n' ...
+                 '   Guide:   %.3e\n'], ...
                 it, obj, relRecon, norm(Aact,'fro'), nnz(Aact), norm(C,'fro'), opts.use_background, ...
                 norm(gradA_fit,'fro'), norm(gradA_lap,'fro'), norm(gradA_excl,'fro'), ...
                 l1_obj, l1_shrink, tau, ...
                 norm(gradC_fit,'fro'), norm(gradC_smooth,'fro'), ...
                 norm(gradF_fit,'fro'), norm(gradF_smooth,'fro'), ...
-                norm(grad_guide, 'fro'));
+                norm(grad_guide,'fro'));
+
         disp('-----------')
     end
 
@@ -522,7 +520,7 @@ info.recon_err = norm(Xpos - B*F, 'fro') / den;
 
 end
 
-% -----------------------
+%% -----------------------
 % local helper
 % -----------------------
 function opts = set_defaults(opts)
@@ -532,11 +530,6 @@ def.quiet_prctile = 20;
 def.n_refine = 1;
 def.nonneg_mode = "none"; % safest for dF/F init
 def.eps0 = 1e-12;
-% the guide from AQuA2 events' projections
-def.lambdaA_guide = 0;        % guide strength (OFF by default)
-def.use_guide_scale = true;   % compute beta each iter
-def.guide_eps = 1e-12;
-
 
 f = fieldnames(def);
 for i = 1:numel(f)
@@ -553,7 +546,7 @@ end
 
 
 
-
+%%
 function opts = set_default_opts(opts)
     def.maxIter = 200;
     def.minIter = 50;
@@ -566,6 +559,11 @@ function opts = set_default_opts(opts)
     def.lambdaF_smooth = 1e-2; % background should be very smooth (often >= lambdaC_smooth)
     def.lambdaB_lap = 5e-3;   % start ~ 5–20x lambdaA_lap
     def.innerB = 3;           % how many gradient steps for B
+
+    % the guide from AQuA2 events' projections
+    def.lambdaA_guide = 0;        % guide strength (OFF by default)
+    def.use_guide_scale = true;   % compute beta each iter
+    def.guide_eps = 1e-12;
 
     def.etaA = 1e-3;
     def.etaC = 1e-3;
@@ -603,7 +601,7 @@ function opts = set_default_opts(opts)
         end
     end
 end
-
+%%
 function obj = objective_val(X, A, C, B, F, L, DtD, opts, guide_act)
     R = X - (A*C + B*F);
     fitTerm = 0.5 * (norm(R,'fro')^2);
@@ -648,7 +646,7 @@ function obj = objective_val(X, A, C, B, F, L, DtD, opts, guide_act)
 
     obj = fitTerm + lapTerm + l1Term + exclTerm + smoothCTerm + smoothFTerm + guideTerm;
 end
-
+%%
 function DtD = build_DtD(T)
     main = [1; 2*ones(T-2,1); 1];
     off  = -1*ones(T-1,1);
@@ -656,7 +654,7 @@ function DtD = build_DtD(T)
     offU = [0; off];
     DtD = spdiags([offL main offU], [-1 0 1], T, T);
 end
-
+%%
 function L = build_laplacian_active(H, W, maskVec, neighborhood)
     maskImg = reshape(maskVec, H, W);
     idxFull = find(maskVec);
@@ -703,12 +701,12 @@ function L = build_laplacian_active(H, W, maskVec, neighborhood)
     D = spdiags(deg, 0, Pm, Pm);
     L = D - Wmat;
 end
-
+%%
 function X = soft_thresh_nonneg(X, tau)
     X = max(0, X - tau);
 end
 
-% L2-normalization on the columns of A
+%% L2-normalization on the columns of A
 function [A, C] = normalize_factors(A, C)
     colNorm = sqrt(sum(A.^2, 1)) + eps;
     A = A ./ colNorm;

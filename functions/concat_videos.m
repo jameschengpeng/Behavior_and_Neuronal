@@ -1,25 +1,44 @@
 %% read all AQuA2 files, concatenate all videos and their dF. It is too slow to write the concatenated video and dF into mat file
-function [concat_dF, concat_datOrg, concat_evt_map, subset_cutting_points, early_reaction_regions] = concat_videos(folder, file_suffix)
-concat_dF = [];
+function [concat_dFF, concat_datOrg, concat_evt_map, subset_cutting_points, early_reaction_regions] = concat_videos(folder, file_suffix)
 concat_datOrg = [];
 concat_evt_map = [];
-subset_cutting_points = []; % if you want a subset of data, here are indices on time axis to cut
+concat_dFF = [];
 
 matFiles = dir(fullfile(folder, "data*.mat"));
-video_num = {};
+video_num = cell(1, numel(matFiles));
 for f = 1:numel(matFiles)
     matName = string(matFiles(f).name);
     tok = regexp(matName, '^data(\d{2})', 'tokens', 'once');
-    video_num = [video_num tok];
+    video_num{f} = tok;
 end
+
+subset_cutting_points = zeros(numel(matFiles), 1); % if you want a subset of data, here are indices on time axis to cut
 
 for video_idx = 1:numel(video_num)
     indexStr = video_num{video_idx};
     aqua_result_file = strcat("data", indexStr, "_", file_suffix, ".mat");
-    aqua_result = load(fullfile(folder, aqua_result_file));
-    
+    fullpath = fullfile(folder, aqua_result_file);
+    try
+        aqua_result = load(fullpath);
+    catch
+        altFolder = replace(folder, "F:\", "D:\");
+        altFullpath = fullfile(altFolder, aqua_result_file);
+        aqua_result = load(altFullpath);
+    end
+
     res = aqua_result.res;
+    smoXY = res.opts.smoXY;
+    T = size(res.datOrg1, 4);
+    datSmo = res.datOrg1;
+    for ii = 1:T % smooth the original data
+        datSmo(:,:,:,ii) = imgaussfilt3(datSmo(:,:,:,ii), smoXY);
+    end
+    % Use AQuA2's built-in function to compute the baseline
+    [F0] = pre.baselineLinearEstimate(datSmo, res.opts.cut, res.opts.movAvgWin);
+    F0 = squeeze(F0);
+    % The noise in dF1 has already been removed
     dF1 = squeeze(res.dF1);
+    concat_dFF = cat(3, concat_dFF, dF1./F0);
     
     if video_idx == 1
         early_reaction_regions = zeros([size(res.datOrg1, 1), size(res.datOrg1, 2)]);
@@ -33,10 +52,9 @@ for video_idx = 1:numel(video_num)
     end
     
     datOrg1 = squeeze(res.datOrg1);
-    concat_dF = cat(3, concat_dF, dF1);
     concat_datOrg = cat(3, concat_datOrg, datOrg1);
     concat_evt_map = cat(3, concat_evt_map, evt_map);
-    subset_cutting_points = [subset_cutting_points; size(datOrg1, 3)];
+    subset_cutting_points(video_idx) = size(datOrg1, 3);
     fprintf('Processed file %s\n', indexStr);
 end
 subset_cutting_points = cumsum(subset_cutting_points);

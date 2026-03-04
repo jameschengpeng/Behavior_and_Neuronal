@@ -1,24 +1,22 @@
 %% 
 clear
-clc
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\scalable_calcium_model_prev'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 
 %% read the saved data, you can start here
 savefile = "F:\Mouse_behavior_data\D21\AQuA2\downsampled_smoothed_data_all_videos.mat";
 saved_data = load(savefile);
-dF1_downsampled_smoothed        = saved_data.dF1_downsampled_smoothed;
-datOrg1_downsampled_smoothed    = saved_data.datOrg1_downsampled_smoothed;
+dFF_downsampled_smoothed        = single(saved_data.dFF_downsampled_smoothed);
+datOrg1_downsampled_smoothed    = single(saved_data.datOrg1_downsampled_smoothed);
 ethogram_mat_downsampled        = saved_data.ethogram_mat_downsampled;
 condensed_ethogram_mat_downsampled = saved_data.condensed_ethogram_mat_downsampled;
 new_subset_cutting_points       = saved_data.new_subset_cutting_points;
 evt_map_downsampled             = saved_data.evt_map_downsampled;
-dFF                             = saved_data.dFF;
 mask_downsampled                = saved_data.mask_downsampled;
 temp_down_factor                = saved_data.temp_down_factor;
 
-new_height = size(dF1_downsampled_smoothed, 1);
-new_width = size(dF1_downsampled_smoothed, 2);
+new_height = size(dFF_downsampled_smoothed, 1);
+new_width = size(dFF_downsampled_smoothed, 2);
 
 if isfield(saved_data, 'mask_downsampled_upper') && isfield(saved_data, 'mask_downsampled_lower')
     mask_downsampled_upper = saved_data.mask_downsampled_upper;
@@ -40,7 +38,7 @@ end
 
 clear saved_data
 
-X_dFF = reshape(dFF, [], size(dFF, 3));
+X_dFF = reshape(dFF_downsampled_smoothed, [], size(dFF_downsampled_smoothed, 3));
 X_dFF = X_dFF';
 if min(X_dFF(:)) < 0
     X_dFF = X_dFF - min(X_dFF(:));  
@@ -48,39 +46,29 @@ end
 
 
 %% Project the active areas detected by AQuA2 into 2D plane
-
 evt_domain_projection = zeros(new_height, new_width);
 conn = bwconncomp(evt_map_downsampled, 6);
-% for ii = 1:conn.NumObjects
-%     indices = conn.PixelIdxList{ii};
-%     [xx, yy, zz] = ind2sub(size(evt_map_downsampled), indices);
-%     xx_select = xx(zz==mode(zz));
-%     yy_select = yy(zz==mode(zz));
-%     ind_2d = sub2ind([size(evt_map_downsampled, 1), size(evt_map_downsampled, 2)], xx_select, yy_select);
-%     if numel(ind_2d) < 0.1 * size(evt_map_downsampled, 1) * size(evt_map_downsampled, 2)
-%         evt_domain_projection(ind_2d) = evt_domain_projection(ind_2d) + 1;
-%     end
-% end
 for ii = 1:conn.NumObjects
     indices = conn.PixelIdxList{ii};
     [xx, yy, zz] = ind2sub(size(evt_map_downsampled), indices);
     xx_select = xx(zz==mode(zz)); % the largest spatial domain of this evt
     yy_select = yy(zz==mode(zz)); % the largest spatial domain of this evt
     ind_2d = sub2ind([new_height, new_width], xx_select, yy_select);
-    if numel(ind_2d) < 0.1 * new_height * new_width
+    if numel(ind_2d) < 0.2 * new_height * new_width
         subs = [xx(:) yy(:)];  % N-by-2, rows are (row,col)
         evt_domain_projection = evt_domain_projection + accumarray( ...
             subs, 1, size(evt_domain_projection), @sum, 0);
     end
 end
-evt_domain_projection(evt_domain_projection == 0) = NaN;
+evt_domain_projection_for_plot = evt_domain_projection;
+evt_domain_projection_for_plot(evt_domain_projection_for_plot == 0) = NaN;
 figure
-imagesc(evt_domain_projection)
+imagesc(evt_domain_projection_for_plot)
 cmap = parula(256);
 cmap(1,:) = [0 0 0];  % make first color black
 colormap(cmap)
 
-clim([min(evt_domain_projection(isfinite(evt_domain_projection))) max(evt_domain_projection(isfinite(evt_domain_projection)))])  % ignore NaNs for scaling
+clim([min(evt_domain_projection_for_plot(isfinite(evt_domain_projection_for_plot))) max(evt_domain_projection_for_plot(isfinite(evt_domain_projection_for_plot)))])  % ignore NaNs for scaling
 colorbar
 %% 
 k_nmf_comp = 4; % number of components in NMF
@@ -94,17 +82,17 @@ opts.quiet_prctile = 10;
 % =====================
 % Iteration / stopping
 % =====================
-opts.maxIter   = 150;
+opts.maxIter   = 80;
 opts.minIter   = 10;
-opts.tol       = 0.01;
+opts.tol       = 0.03;
 
 % =====================
 % Spatial penalties
 % =====================
-opts.lambdaA_L1   = 1;     % sparcity constraint
-opts.lambdaA_lap  = 100;     % smooth contiguous regions
-opts.lambdaA_excl = 100;        % OFF initially (overlap is allowed)
-opts.lambdaA_guide = 1;
+opts.lambdaA_L1   = 0.05;     % sparcity constraint
+opts.lambdaA_lap  = 10;     % smooth contiguous regions
+opts.lambdaA_excl = 5;        % OFF initially (overlap is allowed)
+opts.lambdaA_guide = 5;
 
 % =====================
 % Temporal penalty
@@ -152,15 +140,13 @@ opts.maxBacktrack = 15;
 opts.seed        = 0;
 opts.verbose     = true;
 opts.printEvery = 10;
-
-n_video_train = 10;
+%% train on a small portion of videos, to figure out the A matrix
+n_video_train = 6;
 T_train = new_subset_cutting_points(n_video_train+1);
-
-
 [A_upper, C_upper_train, info_upper_train] = custom_cnmf(X_dFF(1:T_train, :)', new_height, new_width, k_nmf_comp, mask_downsampled_upper, evt_domain_projection, opts);
 [A_lower, C_lower_train, info_lower_train] = custom_cnmf(X_dFF(1:T_train, :)', new_height, new_width, k_nmf_comp, mask_downsampled_lower, evt_domain_projection, opts);
 
-% Use the pre-fitted A and B matrices to figure out the remaining time course
+%% Use the pre-fitted A and B matrices to figure out the remaining time course
 B_upper = info_upper_train.B;
 [C_upper_test, F_upper_test, info_upper_test] = infer_CF_fixed_AB(X_dFF(T_train+1:end, :)', A_upper, B_upper, new_height, new_width, mask_downsampled_upper, opts);
 
@@ -189,6 +175,7 @@ C_augmented = [C; F];
 A_augmented = [A B];
 plotNMF_withBehaviorOnsets(C_augmented, ethogram_mat', 40/temp_down_factor, A_augmented, [new_height, new_width])
 
+
 %%
 X = C';
 [T,n] = size(X);
@@ -214,7 +201,15 @@ for i = 1:n
         bestLag(i,j) = lags(idx);
     end
 end
-
+figure
+imagesc(bestLag)
+%%
+overlay = zeros(new_height, new_width);
+for ii = 1:size(A, 2)
+    overlay = overlay + reshape(A(:,ii), [new_height, new_width]);
+end
+figure
+imagesc(overlay)
 %% obtain the z-score map
 % for each behavior and each NMF component, we extract the relevant time
 % window, and compute z-score for the signals within time-window compared
