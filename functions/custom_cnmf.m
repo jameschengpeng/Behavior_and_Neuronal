@@ -12,6 +12,7 @@ function [A, C, info] = custom_cnmf(X_dFF, H, W, K, mask, evt_domain_projection,
 % Penalties (optional):
 %   - L1(A) sparsity (prox)
 %   - Laplacian smoothness on A: 0.5*lambdaA_lap * tr(A' L A)
+%   - compactness on A (discourage scattered support)
 %   - exclusivity on A (pixelwise overlap)
 %   - temporal smoothness on C: 0.5*lambdaC_smooth * tr(C DtD C')
 %
@@ -53,6 +54,15 @@ end
 % Build Laplacian on ACTIVE pixel graph
 L = build_laplacian_active(H, W, mask, opts.neighborhood);
 
+% Active-pixel coordinates for compactness penalty on A
+[row_act, col_act] = ind2sub([H, W], idx);
+row_act = double(row_act);
+col_act = double(col_act);
+if opts.compact_norm_coords
+    row_act = (row_act - 1) / max(1, H - 1);
+    col_act = (col_act - 1) / max(1, W - 1);
+end
+
 % Temporal smoothness operator D'D (T x T)
 DtD = build_DtD(T);
 
@@ -89,6 +99,17 @@ catch
     [U,S,V] = svd(Xr, 'econ');
     U = U(:,1:K); S = S(1:K,1:K); V = V(:,1:K);
 end
+
+% SVD sign is ambiguous: (u,v) and (-u,-v) are equivalent.
+% Enforce deterministic sign so each spatial mode tends to be positive
+% before nonnegative projection, reducing dead init columns in A.
+for k = 1:K
+    if sum(U(:,k)) < 0
+        U(:,k) = -U(:,k);
+        V(:,k) = -V(:,k);
+    end
+end
+
 Aact = max(0, U * sqrt(S));
 C    = max(0, (sqrt(S) * V'));
 
@@ -107,7 +128,7 @@ end
 
 % Optional normalization (do NOT do every iter by default)
 if opts.doNormalize
-    [Aact, C] = normalize_factors(Aact, C);
+    [Aact, C] = normalize_factors(Aact, C, opts);
 end
 
 info.obj    = zeros(opts.maxIter,1);
@@ -143,6 +164,10 @@ for it = 1:opts.maxIter
         if opts.lambdaA_excl > 0
             LipA = LipA + opts.lambdaA_excl * K;
         end
+        if opts.lambdaA_compact > 0
+            % conservative bound: add compactness contribution scale
+            LipA = LipA + opts.lambdaA_compact * 2;
+        end
         etaA = 0.9 / (LipA + eps);
     else
         etaA = opts.etaA;
@@ -161,13 +186,13 @@ for it = 1:opts.maxIter
 
         if opts.backtracking
             % backtrack if objective increases
-            [objOld] = objective_val(X, Aact, C, B, F, L, DtD, opts, guide_act);
-            [objNew] = objective_val(X, Aact, Cnew, B, F, L, DtD, opts, guide_act);
+            [objOld] = objective_val(X, Aact, C, B, F, L, DtD, opts, guide_act, row_act, col_act);
+            [objNew] = objective_val(X, Aact, Cnew, B, F, L, DtD, opts, guide_act, row_act, col_act);
             bt = 0;
             while objNew > objOld && bt < opts.maxBacktrack
                 etaC = etaC * 0.5;
                 Cnew = max(0, C - etaC * gradC);
-                objNew = objective_val(X, Aact, Cnew, B, F, L, DtD, opts, guide_act);
+                objNew = objective_val(X, Aact, Cnew, B, F, L, DtD, opts, guide_act, row_act, col_act);
                 bt = bt + 1;
             end
         end
@@ -213,9 +238,24 @@ for it = 1:opts.maxIter
     
         % ---- Update F on ALL frames using full residual (but B fixed)
         BtB = (B' * B) + opts.bg_eps * eye(r);
-        Lb = chol(BtB, 'lower');
-        F = Lb'\(Lb\(B' * R0pos));               % <-- now defined
-        F = max(F, 0);
+        BR  = (B' * R0pos);
+
+        if opts.lambdaF_smooth > 0
+            % Solve: min_F 0.5||R0pos - B*F||_F^2 + 0.5*lambdaF*tr(F*DtD*F')
+            % via projected-gradient (nonnegative F)
+            LipF = norm(BtB, 2) + opts.lambdaF_smooth * 4;
+            etaF = 0.9 / (LipF + eps);
+
+            for sF = 1:opts.innerF
+                gradF = (BtB * F - BR) + opts.lambdaF_smooth * (F * DtD);
+                F = max(0, F - etaF * gradF);
+            end
+        else
+            % Closed-form NNLS proxy when no temporal smoothing is requested
+            Lb = chol(BtB, 'lower');
+            F = Lb'\(Lb\BR);
+            F = max(F, 0);
+        end
     
         % Optional stabilization: normalize columns of B, rescale F
         coln = sqrt(sum(B.^2,1)) + opts.bg_eps;
@@ -238,6 +278,12 @@ for it = 1:opts.maxIter
             sumA = sum(Aact, 2);
             gradExcl = (sumA * ones(1,K)) - Aact;
             gradA = gradA + opts.lambdaA_excl * gradExcl;
+        end
+
+        % ---- Compactness penalty (discourage scattered A support)
+        if opts.lambdaA_compact > 0
+            [dist2_compact, ~] = compactness_dist2_and_term(Aact, row_act, col_act, opts.compact_eps);
+            gradA = gradA + opts.lambdaA_compact * dist2_compact;
         end
 
         % ---- Guide penalty (match sum of A to AQuA2 projection)
@@ -266,8 +312,8 @@ for it = 1:opts.maxIter
         end
 
         if opts.backtracking
-            objOld = objective_val(X, Aact, C, B, F, L, DtD, opts, guide_act);
-            objNew = objective_val(X, Anew, C, B, F, L, DtD, opts, guide_act);
+            objOld = objective_val(X, Aact, C, B, F, L, DtD, opts, guide_act, row_act, col_act);
+            objNew = objective_val(X, Anew, C, B, F, L, DtD, opts, guide_act, row_act, col_act);
             bt = 0;
             while objNew > objOld && bt < opts.maxBacktrack
                 etaA = etaA * 0.5;
@@ -277,7 +323,7 @@ for it = 1:opts.maxIter
                 else
                     Anew = max(Anew, 0);
                 end
-                objNew = objective_val(X, Anew, C, B, F, L, DtD, opts, guide_act);
+                objNew = objective_val(X, Anew, C, B, F, L, DtD, opts, guide_act, row_act, col_act);
                 bt = bt + 1;
             end
         end
@@ -287,11 +333,11 @@ for it = 1:opts.maxIter
 
     % Optional normalization (do rarely)
     if opts.doNormalize && mod(it, opts.normalizeEvery) == 0
-        [Aact, C] = normalize_factors(Aact, C);
+        [Aact, C] = normalize_factors(Aact, C, opts);
     end
 
     % ---- Diagnostics
-    obj = objective_val(X, Aact, C, B, F, L, DtD, opts, guide_act);
+    obj = objective_val(X, Aact, C, B, F, L, DtD, opts, guide_act, row_act, col_act);
     info.obj(it) = obj;
 
     relRecon = norm(X - (Aact*C + B*F), 'fro')^2 / (norm(X,'fro')^2 + eps);
@@ -326,12 +372,27 @@ for it = 1:opts.maxIter
             sumA = sum(Aact, 2);
             gradA_excl = opts.lambdaA_excl * ((sumA * ones(1,size(Aact,2))) - Aact);
         end
+
+        gradA_compact = zeros(size(Aact));
+        if opts.lambdaA_compact > 0
+            [dist2_compact, compact_obj] = compactness_dist2_and_term(Aact, row_act, col_act, opts.compact_eps);
+            gradA_compact = opts.lambdaA_compact * dist2_compact;
+        else
+            compact_obj = 0;
+        end
+        compact_grad_ratio = norm(gradA_compact,'fro') / (norm(gradA_fit,'fro') + eps);
     
         % L1 diagnostics
         tau = etaA * opts.lambdaA_L1;
         l1_obj = opts.lambdaA_L1 * sum(Aact(:));
+
+        % Sparsity diagnostics per component (column of A)
+        nnzA_col = sum(Aact > 0, 1);                              % 1 x K
+        pctA_col = 100 * (nnzA_col / max(1, size(Aact,1)));       % 1 x K
+        nnzA_col_str = strtrim(sprintf('%d ', nnzA_col));
+        pctA_col_str = strtrim(sprintf('%.2f%% ', pctA_col));
     
-        Atemp = Aact - etaA * (gradA_fit + gradA_lap + gradA_excl);
+        Atemp = Aact - etaA * (gradA_fit + gradA_lap + gradA_excl + gradA_compact);
         if opts.lambdaA_L1 > 0
             Aprox = soft_thresh_nonneg(Atemp, tau);
         else
@@ -383,16 +444,19 @@ for it = 1:opts.maxIter
         % ---- Print ----
         % =========================
         fprintf(['Iter %4d | obj %.4e | relRecon %.4g | ||A|| %.3e nnzA %d | ||C|| %.3e | bg %d\n' ...
-                 '   A-grad:  fit %.3e | lap %.3e | excl %.3e | L1obj %.3e | prox %.3e | tau %.3e\n' ...
+             '   A-grad:  fit %.3e | lap %.3e | excl %.3e | compact %.3e (ratio %.3f) | L1obj %.3e | prox %.3e | tau %.3e\n' ...
+                 '   A-nnz:   count/col [%s]\n' ...
+                 '   A-nnz%%:  pct/col   [%s]\n' ...
                  '   C-grad:  fit %.3e | smooth %.3e\n' ...
                  '   F-grad:  fit %.3e | smooth %.3e\n' ...
-                 '   Guide:   %.3e\n'], ...
+                 '   Guide:   %.3e | CompactObj(raw) %.3e\n'], ...
                 it, obj, relRecon, norm(Aact,'fro'), nnz(Aact), norm(C,'fro'), opts.use_background, ...
-                norm(gradA_fit,'fro'), norm(gradA_lap,'fro'), norm(gradA_excl,'fro'), ...
-                l1_obj, l1_shrink, tau, ...
+            norm(gradA_fit,'fro'), norm(gradA_lap,'fro'), norm(gradA_excl,'fro'), norm(gradA_compact,'fro'), ...
+                compact_grad_ratio, l1_obj, l1_shrink, tau, ...
+                nnzA_col_str, pctA_col_str, ...
                 norm(gradC_fit,'fro'), norm(gradC_smooth,'fro'), ...
                 norm(gradF_fit,'fro'), norm(gradF_smooth,'fro'), ...
-                norm(grad_guide,'fro'));
+                norm(grad_guide,'fro'), compact_obj);
 
         disp('-----------')
     end
@@ -447,7 +511,7 @@ function [B, F, info] = init_background_lowrank(X, opts)
 %          - recon_err (scalar) ||Xpos - B*F||_F / ||Xpos||_F after init
 
 if nargin < 2, opts = struct(); end
-opts = set_defaults(opts);
+opts = set_defaults_for_background(opts);
 
 [Pm, T] = size(X);
 r = opts.bg_rank;
@@ -523,7 +587,7 @@ end
 %% -----------------------
 % local helper
 % -----------------------
-function opts = set_defaults(opts)
+function opts = set_defaults_for_background(opts)
 def.bg_rank = 3;
 def.use_quiet_init = true;
 def.quiet_prctile = 20;
@@ -548,6 +612,12 @@ end
 
 %%
 function opts = set_default_opts(opts)
+    % Backward compatibility:
+    % if old field `quiet_prctile` is provided, map it to bg_quiet_prctile
+    if isfield(opts, 'quiet_prctile') && ~isfield(opts, 'bg_quiet_prctile')
+        opts.bg_quiet_prctile = opts.quiet_prctile;
+    end
+
     def.maxIter = 200;
     def.minIter = 50;
     def.tol = 1e-5;
@@ -555,10 +625,14 @@ function opts = set_default_opts(opts)
     def.lambdaA_L1 = 1e-6;
     def.lambdaA_lap = 1e-4;
     def.lambdaA_excl = 0;          % start OFF
+    def.lambdaA_compact = 0;       % OFF by default (discourage scattered A)
+    def.compact_eps = 1e-12;
+    def.compact_norm_coords = true;
     def.lambdaC_smooth = 1e-4;
     def.lambdaF_smooth = 1e-2; % background should be very smooth (often >= lambdaC_smooth)
     def.lambdaB_lap = 5e-3;   % start ~ 5–20x lambdaA_lap
     def.innerB = 3;           % how many gradient steps for B
+    def.innerF = 3;           % how many projected-gradient steps for F
 
     % the guide from AQuA2 events' projections
     def.lambdaA_guide = 0;        % guide strength (OFF by default)
@@ -575,6 +649,8 @@ function opts = set_default_opts(opts)
 
     def.doNormalize = true;
     def.normalizeEvery = 10;       % NEW: normalize infrequently
+    def.normalize_mode = "l2";    % "l2" or "p99"
+    def.normalize_prctile = 99;    % used when normalize_mode="p99"
     def.neighborhood = 4;
     def.seed = 0;
 
@@ -600,9 +676,13 @@ function opts = set_default_opts(opts)
             opts.(f{i}) = def.(f{i});
         end
     end
+
+    % Guardrail for quiet frame percentile used by background updates
+    opts.bg_quiet_prctile = min(50, max(1, opts.bg_quiet_prctile));
+    opts.normalize_prctile = min(100, max(50, opts.normalize_prctile));
 end
 %%
-function obj = objective_val(X, A, C, B, F, L, DtD, opts, guide_act)
+function obj = objective_val(X, A, C, B, F, L, DtD, opts, guide_act, row_act, col_act)
     R = X - (A*C + B*F);
     fitTerm = 0.5 * (norm(R,'fro')^2);
 
@@ -617,6 +697,12 @@ function obj = objective_val(X, A, C, B, F, L, DtD, opts, guide_act)
     if opts.lambdaA_excl > 0
         sumA = sum(A,2);
         exclTerm = opts.lambdaA_excl * 0.5 * sum( sumA.^2 - sum(A.^2,2) );
+    end
+
+    compactTerm = 0;
+    if opts.lambdaA_compact > 0
+        [~, compact_raw] = compactness_dist2_and_term(A, row_act, col_act, opts.compact_eps);
+        compactTerm = opts.lambdaA_compact * compact_raw;
     end
 
     smoothCTerm = 0;
@@ -644,7 +730,23 @@ function obj = objective_val(X, A, C, B, F, L, DtD, opts, guide_act)
         guideTerm = 0.5 * opts.lambdaA_guide * (r' * r);
     end
 
-    obj = fitTerm + lapTerm + l1Term + exclTerm + smoothCTerm + smoothFTerm + guideTerm;
+    obj = fitTerm + lapTerm + l1Term + exclTerm + compactTerm + smoothCTerm + smoothFTerm + guideTerm;
+end
+
+function [dist2, compact_raw] = compactness_dist2_and_term(A, row_act, col_act, eps0)
+% Distances to per-component centroid for compactness penalty on A.
+% dist2(p,k) = ||x_p - mu_k||^2, where mu_k is weighted by A(:,k).
+
+[Pm, K] = size(A);
+rr = row_act(:);  % Pm x 1
+cc = col_act(:);  % Pm x 1
+
+mass = sum(A, 1) + eps0;                     % 1 x K
+mu_r = (rr' * A) ./ mass;                    % 1 x K
+mu_c = (cc' * A) ./ mass;                    % 1 x K
+
+dist2 = (rr - mu_r).^2 + (cc - mu_c).^2;     % Pm x K (implicit expansion)
+compact_raw = sum(sum(A .* dist2));
 end
 %%
 function DtD = build_DtD(T)
@@ -707,8 +809,22 @@ function X = soft_thresh_nonneg(X, tau)
 end
 
 %% L2-normalization on the columns of A
-function [A, C] = normalize_factors(A, C)
-    colNorm = sqrt(sum(A.^2, 1)) + eps;
-    A = A ./ colNorm;
-    C = C .* colNorm';
+function [A, C] = normalize_factors(A, C, opts)
+    mode = string(opts.normalize_mode);
+    switch mode
+        case "l2"
+            scale = sqrt(sum(A.^2, 1)) + eps;
+        case "p99"
+            K = size(A,2);
+            scale = zeros(1, K);
+            for k = 1:K
+                scale(k) = prctile(A(:,k), opts.normalize_prctile);
+            end
+            scale = max(scale, eps);
+        otherwise
+            error('opts.normalize_mode must be "l2" or "p99".');
+    end
+
+    A = A ./ scale;
+    C = C .* scale';
 end

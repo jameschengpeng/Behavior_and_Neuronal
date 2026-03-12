@@ -5,16 +5,27 @@ addpath(genpath('C:\Users\james\CBIL\Astrocyte\scalable_calcium_model_prev'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\AQuA2_code'));
 %%
-AQuA2_file_suffix = "ManualMoco_cropped_AQuA2"; % for cck
+AQuA2_file_suffix = "ManualMoCo_cropped_AQuA2"; % for cck with or without injury
 
-% For the CCK neuronal data
-AQuA2_result_path = "F:\Mouse_behavior_data\D21\AQuA2";
-condensed_ethogram_scoring_path = "F:\Mouse_behavior_data\D21\Condensed_EthogramScoring";
-preprocessed_storage_path = "F:\Mouse_behavior_data\D21\preprocessed_data";
-stim_scoring_filepath = "F:\Mouse_behavior_data\D21\StimulusScoring.xlsx";
+% % For the CCK neuronal data with injury
+% AQuA2_result_path = "F:\Mouse_behavior_data\D21\AQuA2";
+% condensed_ethogram_scoring_path = "F:\Mouse_behavior_data\D21\Condensed_EthogramScoring";
+% preprocessed_storage_path = "F:\Mouse_behavior_data\D21\preprocessed_data";
+% stim_scoring_filepath = "F:\Mouse_behavior_data\D21\StimulusScoring.xlsx";
+
+% For the CCK neuronal data without injury
+AQuA2_result_path = "F:\CCK_PilotData_Baseline\AQuA2";
+condensed_ethogram_scoring_path = "F:\CCK_PilotData_Baseline\BaselineBehaviorScoring";
+preprocessed_storage_path = "F:\CCK_PilotData_Baseline\preprocessed_data";
+stim_scoring_filepath = [];
+
 
 %% 
-stim_scoring_table = get_stim_metadata(stim_scoring_filepath);
+if ~isempty(stim_scoring_filepath)
+    stim_scoring_table = get_stim_metadata(stim_scoring_filepath);
+else
+    stim_scoring_table = [];
+end
 matFiles = dir(fullfile(AQuA2_result_path, "data*.mat"));
 
 for f = 1:numel(matFiles)
@@ -29,11 +40,21 @@ end
 function single_video_preprocess_and_save(video_idxStr, stim_scoring_table,...
     AQuA2_file_suffix, AQuA2_result_path, condensed_ethogram_scoring_path, preprocessed_storage_path)
 % indexStr like '01', '02', ...
-rowIdx = stim_scoring_table.Data == ("data" + video_idxStr);   % logical 32x1
-StimLocation = stim_scoring_table.StimLocation(rowIdx);        % string (or 1x1)
+if ~isempty(stim_scoring_table)
+    rowIdx = stim_scoring_table.Data == ("data" + video_idxStr);   % logical n_videos x 1
+    StimLocation = stim_scoring_table.StimLocation(rowIdx);        % string (or 1x1)
+else
+    StimLocation = [];
+end
 
-% create the folderPath for StimLocation left or right
-folderPath = fullfile(preprocessed_storage_path, StimLocation);
+% create the folderPath for StimLocation left or right, if there is no
+% stimulus, put everything together
+if ~isempty(StimLocation)
+    folderPath = fullfile(preprocessed_storage_path, StimLocation);
+else
+    folderPath = fullfile(preprocessed_storage_path, "all");
+end
+
 if ~exist(folderPath, 'dir')
     mkdir(folderPath);
 end

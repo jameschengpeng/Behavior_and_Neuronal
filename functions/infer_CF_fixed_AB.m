@@ -30,16 +30,20 @@ function [C, F, info] = infer_CF_fixed_AB(X_dFF, A_full, B_full, H, W, mask, opt
 if nargin < 7, opts = struct(); end
 if nargin < 3 || isempty(B_full)
     B_full = [];
-    use_background = false;
-else
-    use_background = true;
 end
 
 opts = set_default_opts(opts);
+use_background = ~isempty(B_full);
+if isfield(opts, 'use_background')
+    use_background = logical(opts.use_background) && ~isempty(B_full);
+end
 
 [P, T] = size(X_dFF);
 assert(P == H*W, 'X_dFF must have P=H*W rows.');
 assert(size(A_full, 1) == P, 'A_full must have P rows.');
+if use_background
+    assert(size(B_full, 1) == P, 'B_full must have P rows.');
+end
 
 mask = reshape(mask, [], 1) ~= 0;
 assert(numel(mask) == P, 'mask must be HxW or P-vector.');
@@ -49,7 +53,7 @@ K = size(A_full, 2);
 % Active pixels only (tissue)
 idx = find(mask);
 Pm  = numel(idx);
-Xraw = double(X_dFF(idx, :));
+Xraw = X_dFF(idx, :);
 
 % Nonnegativity handling for X
 X = Xraw;
@@ -77,8 +81,27 @@ else
     r = 0;
 end
 
+% Optional baseline anchoring for F using a low quantile from training phase.
+% If enabled, after each F update we shift each row of F so that its chosen
+% quantile matches the provided reference quantile baseline.
+if use_background && opts.enforce_F_quantile_baseline
+    assert(~isempty(opts.F_quantile_ref), ...
+        'opts.F_quantile_ref must be provided when enforce_F_quantile_baseline=true.');
+    assert(numel(opts.F_quantile_ref) == r, ...
+        'numel(opts.F_quantile_ref) must equal number of background rows r.');
+end
+
 % Temporal smoothness operator D'D (T x T)
 DtD = build_DtD(T);
+if isa(X, 'single')
+    % Some MATLAB versions do not allow single() cast on sparse matrices.
+    % Keep DtD as-is if casting is unsupported.
+    try
+        DtD = single(DtD);
+    catch
+        % fallback: leave DtD as sparse double
+    end
+end
 
 % ---------------------------
 % Initialization
@@ -90,31 +113,27 @@ if use_background
     % Solve: min ||X - A*C - B*F||^2 for C, F jointly (alternating init)
     % Start with F = 0
     F = zeros(r, T);
-    AAt = Aact' * Aact + opts.bg_eps * eye(K);
+    AAt = Aact' * Aact + opts.bg_eps * eye(K, 'like', Aact);
     AtX = Aact' * X;
     C = AAt \ AtX;  % K x T
     C = max(C, 0);
     
     % Then update F given C
-    BtB = Bact' * Bact + opts.bg_eps * eye(r);
+    BtB = Bact' * Bact + opts.bg_eps * eye(r, 'like', Bact);
     BtR = Bact' * (X - Aact*C);
     F = BtB \ BtR;  % r x T
     F = max(F, 0);
 else
     % No background: simple NNLS
-    AAt = Aact' * Aact + opts.bg_eps * eye(K);
+    AAt = Aact' * Aact + opts.bg_eps * eye(K, 'like', Aact);
     AtX = Aact' * X;
     C = AAt \ AtX;  % K x T
     C = max(C, 0);
     F = zeros(0, T);
 end
 
-% Reinit any dead components
-for k = 1:K
-    if all(C(k,:) == 0)
-        C(k,:) = max(0, rand(1,T));
-    end
-end
+% For fixed-A inference, a dead component can be valid (absent in this split).
+% Do not randomly reinitialize zero rows of C, to avoid injecting false activity.
 
 info.obj    = zeros(opts.maxIter,1);
 info.relchg = zeros(opts.maxIter,1);
@@ -151,7 +170,7 @@ for it = 1:opts.maxIter
     for s = 1:opts.innerC
         % grad wrt C: A'*(A*C + B*F - X) + lambdaC*(C*DtD)
         R = (Aact*C + Bact*F) - X;
-        gradC = (Aact' * R) + opts.lambdaC_smooth * (C * DtD);
+        gradC = (Aact' * R) + opts.lambdaC_smooth * apply_DtD_right(C, DtD);
         
         Cnew = max(0, C - etaC * gradC);
 
@@ -178,7 +197,7 @@ for it = 1:opts.maxIter
         for s = 1:opts.innerF
             % grad wrt F: B'*(A*C + B*F - X) + lambdaF*(F*DtD)
             R = (Aact*C + Bact*F) - X;
-            gradF = (Bact' * R) + opts.lambdaF_smooth * (F * DtD);
+            gradF = (Bact' * R) + opts.lambdaF_smooth * apply_DtD_right(F, DtD);
             
             Fnew = max(0, F - etaF * gradF);
 
@@ -195,6 +214,14 @@ for it = 1:opts.maxIter
             end
 
             F = Fnew;
+        end
+
+        % Optional quantile-baseline anchoring (row-wise)
+        if opts.enforce_F_quantile_baseline
+            q_cur = prctile(F, opts.F_baseline_prctile, 2);      % r x 1
+            q_ref = reshape(opts.F_quantile_ref, [], 1);         % r x 1
+            delta = cast(q_ref - q_cur, 'like', F);              % r x 1
+            F = max(0, F + opts.F_baseline_anchor_strength * (delta * ones(1, T, 'like', F)));
         end
     end
 
@@ -238,6 +265,12 @@ function opts = set_default_opts(opts)
     def.lambdaC_smooth = 1e-4;
     def.lambdaF_smooth = 1e-2; % background should be very smooth
 
+    % Optional baseline anchoring for F)
+    def.enforce_F_quantile_baseline = true; % whether to shift F after each update to keep a chosen quantile anchored
+    def.F_baseline_prctile = 5;      % e.g., 5 or 10
+    def.F_quantile_ref = [];          % r x 1 reference from training F
+    def.F_baseline_anchor_strength = 1; % 0..1 (1 = full correction each iter)
+
     def.etaC = 1e-3;
     def.etaF = 1e-3;
 
@@ -264,6 +297,13 @@ function opts = set_default_opts(opts)
             opts.(f{i}) = def.(f{i});
         end
     end
+
+    % Accept either fraction (0-1) or percentile (0-100)
+    if opts.F_baseline_prctile <= 1
+        opts.F_baseline_prctile = 100 * opts.F_baseline_prctile;
+    end
+    opts.F_baseline_prctile = min(100, max(0, opts.F_baseline_prctile));
+    opts.F_baseline_anchor_strength = min(1, max(0, opts.F_baseline_anchor_strength));
 end
 
 function obj = objective_val(X, A, C, B, F, DtD, opts)
@@ -272,12 +312,14 @@ function obj = objective_val(X, A, C, B, F, DtD, opts)
 
     smoothCTerm = 0;
     if opts.lambdaC_smooth > 0
-        smoothCTerm = 0.5 * opts.lambdaC_smooth * trace(C * (DtD * C'));
+        CDtD = apply_DtD_right(C, DtD);
+        smoothCTerm = 0.5 * opts.lambdaC_smooth * sum(C(:) .* CDtD(:));
     end
 
     smoothFTerm = 0;
     if opts.lambdaF_smooth > 0 && ~isempty(F)
-        smoothFTerm = 0.5 * opts.lambdaF_smooth * trace(F * (DtD * F'));
+        FDtD = apply_DtD_right(F, DtD);
+        smoothFTerm = 0.5 * opts.lambdaF_smooth * sum(F(:) .* FDtD(:));
     end
 
     obj = fitTerm + smoothCTerm + smoothFTerm;
@@ -289,4 +331,25 @@ function DtD = build_DtD(T)
     offL = [off; 0];
     offU = [0; off];
     DtD = spdiags([offL main offU], [-1 0 1], T, T);
+end
+
+function Y = apply_DtD_right(X, DtD)
+% Compute X * DtD with compatibility for sparse-double DtD and single X.
+% Uses explicit 1D second-difference form when sparse-single mtimes is unsupported.
+
+if issparse(DtD) && isa(X, 'single')
+    [R, T] = size(X);
+    Y = zeros(R, T, 'like', X);
+
+    if T == 1
+        Y(:,1) = X(:,1);
+        return;
+    end
+
+    Y(:,1)   = X(:,1) - X(:,2);
+    Y(:,2:T-1) = 2*X(:,2:T-1) - X(:,1:T-2) - X(:,3:T);
+    Y(:,T)   = X(:,T) - X(:,T-1);
+else
+    Y = X * DtD;
+end
 end
