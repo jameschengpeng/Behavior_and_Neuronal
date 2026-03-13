@@ -152,7 +152,7 @@ opts.tol       = 0.03;
 % =====================
 % Spatial penalties
 % =====================
-opts.lambdaA_L1   = 25;     % sparcity constraint
+opts.lambdaA_L1   = 30;     % sparcity constraint
 opts.lambdaA_lap  = 2e3;     % smooth contiguous regions
 opts.lambdaA_excl = 5e2;        % OFF initially (overlap is allowed)
 opts.lambdaA_guide = 0;
@@ -162,7 +162,13 @@ opts.lambdaA_compact = 1e2;  % encourage compactness (e.g., for groups of neuron
 % Temporal penalty
 % =====================
 opts.lambdaC_smooth = 1e-1;   % smooth calcium dynamics
-opts.lambdaF_smooth = 10;
+opts.lambdaF_smooth = 5;
+opts.use_lowfreq_F_basis = false; % constrain background to low-frequency subspace
+opts.F_basis_type = "dct";
+opts.F_basis_count = 12; % moderate flexibility for background without letting it absorb fast C transients
+opts.lambdaF_q_l2 = 5e-3;
+opts.enforce_F_quantile_baseline = true;
+opts.F_baseline_anchor_strength = 0.2;
 
 % =====================
 % Step sizes / solver
@@ -206,7 +212,7 @@ opts.maxBacktrack = 15;
 opts.seed        = 0;
 opts.verbose     = true;
 opts.printEvery = 10;
-opts.F_baseline_prctile = 5; % baseline quantile used by infer_CF_fixed_AB anchoring
+opts.F_baseline_prctile = 10; % baseline quantile used by infer_CF_fixed_AB anchoring
 %% train on a small portion of videos, to figure out the A matrix
 subset_cutting_points = cumsum(video_lengths);
 subset_cutting_points = [0; subset_cutting_points];
@@ -240,6 +246,7 @@ end
 
 
 [A_upper, C_upper_train, info_upper_train] = custom_cnmf(X_data(:, time_train), H, W, k_nmf_comp, mask_upper_half, evt_domain_projection, opts);
+%%
 [A_lower, C_lower_train, info_lower_train] = custom_cnmf(X_data(:, time_train), H, W, k_nmf_comp, mask_lower_half, evt_domain_projection, opts);
 
 %% show the training outcome

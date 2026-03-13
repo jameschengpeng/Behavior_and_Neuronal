@@ -66,6 +66,17 @@ end
 % Temporal smoothness operator D'D (T x T)
 DtD = build_DtD(T);
 
+% Optional low-frequency basis for background F: F = q * Hf
+if opts.use_lowfreq_F_basis && opts.use_background
+    Hf = build_temporal_basis(T, opts);     % nBasis x T
+    HHt = Hf * Hf';                         % nBasis x nBasis
+    HfDtDHfT = Hf * DtD * Hf';              % nBasis x nBasis
+else
+    Hf = [];
+    HHt = [];
+    HfDtDHfT = [];
+end
+
 % ---------------------------
 % Initialization
 % ---------------------------
@@ -83,9 +94,31 @@ if opts.use_background
     bgopts.nonneg_mode = "clip";
     bgopts.eps0 = opts.bg_eps;
     [B, F] = init_background_lowrank(X, bgopts);   % B: Pm x r, F: r x T
+    if opts.use_lowfreq_F_basis
+        q = project_F_to_basis(F, Hf, opts.bg_eps); % r x nBasis
+        q = max(q, 0);
+        F = q * Hf;
+    else
+        q = [];
+    end
 else
     B = zeros(Pm, 0);
     F = zeros(0, T);
+    q = [];
+end
+
+% Optional baseline anchoring for F during training.
+% If no reference is provided, use the initialized F quantile as reference.
+if opts.use_background && opts.enforce_F_quantile_baseline
+    if isempty(opts.F_quantile_ref)
+        F_quantile_ref_train = prctile(F, opts.F_baseline_prctile, 2);
+    else
+        assert(numel(opts.F_quantile_ref) == r, ...
+            'numel(opts.F_quantile_ref) must equal background rank r.');
+        F_quantile_ref_train = reshape(opts.F_quantile_ref, [], 1);
+    end
+else
+    F_quantile_ref_train = [];
 end
 
 
@@ -240,7 +273,31 @@ for it = 1:opts.maxIter
         BtB = (B' * B) + opts.bg_eps * eye(r);
         BR  = (B' * R0pos);
 
-        if opts.lambdaF_smooth > 0
+        if opts.use_lowfreq_F_basis
+            % Update q in F = q*Hf. This constrains F to low-frequency content.
+            if isempty(q)
+                q = project_F_to_basis(F, Hf, opts.bg_eps);
+            end
+
+            LipQ = norm(BtB, 2) * norm(HHt, 2);
+            if opts.lambdaF_smooth > 0
+                LipQ = LipQ + opts.lambdaF_smooth * norm(HfDtDHfT, 2);
+            end
+            LipQ = LipQ + opts.lambdaF_q_l2;
+            etaQ = 0.9 / (LipQ + eps);
+
+            for sF = 1:opts.innerF
+                gradQ = (BtB * q * HHt - BR * Hf');
+                if opts.lambdaF_smooth > 0
+                    gradQ = gradQ + opts.lambdaF_smooth * (q * HfDtDHfT);
+                end
+                if opts.lambdaF_q_l2 > 0
+                    gradQ = gradQ + opts.lambdaF_q_l2 * q;
+                end
+                q = max(0, q - etaQ * gradQ);
+            end
+            F = q * Hf;
+        elseif opts.lambdaF_smooth > 0
             % Solve: min_F 0.5||R0pos - B*F||_F^2 + 0.5*lambdaF*tr(F*DtD*F')
             % via projected-gradient (nonnegative F)
             LipF = norm(BtB, 2) + opts.lambdaF_smooth * 4;
@@ -261,6 +318,22 @@ for it = 1:opts.maxIter
         coln = sqrt(sum(B.^2,1)) + opts.bg_eps;
         B = B ./ coln;
         F = F .* coln';
+        if opts.use_lowfreq_F_basis && ~isempty(q)
+            q = q .* coln';
+        end
+
+        % Optional quantile-baseline anchoring (row-wise) to prevent F drift.
+        if opts.enforce_F_quantile_baseline && ~isempty(F_quantile_ref_train)
+            q_cur = prctile(F, opts.F_baseline_prctile, 2);      % r x 1
+            delta = cast(F_quantile_ref_train - q_cur, 'like', F);
+            F_anchor = max(0, F + opts.F_baseline_anchor_strength * (delta * ones(1, T, 'like', F)));
+            if opts.use_lowfreq_F_basis
+                q = max(0, project_F_to_basis(F_anchor, Hf, opts.bg_eps));
+                F = q * Hf;
+            else
+                F = F_anchor;
+            end
+        end
     end
 
     % =========================
@@ -481,6 +554,10 @@ A(idx, :) = Aact;
 info.B = zeros(P,size(B,2));
 info.B(idx, :) = B;
 info.F = F;
+if opts.use_lowfreq_F_basis
+    info.F_basis = Hf;
+    info.F_coeff = q;
+end
 
 end
 
@@ -630,6 +707,11 @@ function opts = set_default_opts(opts)
     def.compact_norm_coords = true;
     def.lambdaC_smooth = 1e-4;
     def.lambdaF_smooth = 1e-2; % background should be very smooth (often >= lambdaC_smooth)
+    def.lambdaF_q_l2 = 0;      % optional ridge on q for F=q*Hf
+    def.enforce_F_quantile_baseline = false;
+    def.F_baseline_prctile = 5;
+    def.F_quantile_ref = [];
+    def.F_baseline_anchor_strength = 0.5;
     def.lambdaB_lap = 5e-3;   % start ~ 5–20x lambdaA_lap
     def.innerB = 3;           % how many gradient steps for B
     def.innerF = 3;           % how many projected-gradient steps for F
@@ -659,6 +741,10 @@ function opts = set_default_opts(opts)
     def.bg_rank = 3;
     def.bg_eps = 1e-12;          % small ridge for SPD solves
     def.bg_quiet_prctile = 20;   % for init (optional)
+    def.use_lowfreq_F_basis = false;
+    def.F_basis_type = "dct";
+    def.F_basis_count = 12;
+    def.F_basis_fraction = 0.1;
 
     % NEW: backtracking safeguard
     def.backtracking = true;
@@ -680,6 +766,35 @@ function opts = set_default_opts(opts)
     % Guardrail for quiet frame percentile used by background updates
     opts.bg_quiet_prctile = min(50, max(1, opts.bg_quiet_prctile));
     opts.normalize_prctile = min(100, max(50, opts.normalize_prctile));
+    if opts.F_baseline_prctile <= 1
+        opts.F_baseline_prctile = 100 * opts.F_baseline_prctile;
+    end
+    opts.F_baseline_prctile = min(100, max(0, opts.F_baseline_prctile));
+    opts.F_baseline_anchor_strength = min(1, max(0, opts.F_baseline_anchor_strength));
+end
+
+function Hf = build_temporal_basis(T, opts)
+% Build low-frequency temporal basis Hf (nBasis x T) for F = q*Hf.
+nb = round(opts.F_basis_count);
+if nb <= 0
+    nb = max(2, round(opts.F_basis_fraction * T));
+end
+nb = min(T, max(1, nb));
+
+basisType = lower(char(opts.F_basis_type));
+switch basisType
+    case 'dct'
+        C = dctmtx(T);
+        Hf = C(1:nb, :);
+    otherwise
+        error('Unsupported opts.F_basis_type: %s. Use "dct".', opts.F_basis_type);
+end
+end
+
+function q = project_F_to_basis(F, Hf, eps0)
+% Least-squares projection of F onto span(Hf): q = F*Hf'/(Hf*Hf').
+HHt = Hf * Hf';
+q = (F * Hf') / (HHt + eps0 * eye(size(HHt), 'like', HHt));
 end
 %%
 function obj = objective_val(X, A, C, B, F, L, DtD, opts, guide_act, row_act, col_act)

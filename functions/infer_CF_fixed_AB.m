@@ -103,6 +103,17 @@ if isa(X, 'single')
     end
 end
 
+% Optional low-frequency basis for background F: F = q * Hf
+if use_background && opts.use_lowfreq_F_basis
+    Hf = build_temporal_basis(T, opts);     % nBasis x T
+    HHt = Hf * Hf';                         % nBasis x nBasis
+    HfDtDHfT = Hf * DtD * Hf';              % nBasis x nBasis
+else
+    Hf = [];
+    HHt = [];
+    HfDtDHfT = [];
+end
+
 % ---------------------------
 % Initialization
 % ---------------------------
@@ -123,6 +134,13 @@ if use_background
     BtR = Bact' * (X - Aact*C);
     F = BtB \ BtR;  % r x T
     F = max(F, 0);
+    if opts.use_lowfreq_F_basis
+        q = project_F_to_basis(F, Hf, opts.bg_eps);
+        q = max(q, 0);
+        F = q * Hf;
+    else
+        q = [];
+    end
 else
     % No background: simple NNLS
     AAt = Aact' * Aact + opts.bg_eps * eye(K, 'like', Aact);
@@ -130,6 +148,7 @@ else
     C = AAt \ AtX;  % K x T
     C = max(C, 0);
     F = zeros(0, T);
+    q = [];
 end
 
 % For fixed-A inference, a dead component can be valid (absent in this split).
@@ -154,14 +173,24 @@ for it = 1:opts.maxIter
         etaC = 0.9 / (LipC + eps);
         
         if use_background
-            % LipF ~ ||B'B||_2 + lambdaF*||DtD||_2
             BtB = Bact' * Bact;              % r x r
-            LipF = norm(BtB, 2) + opts.lambdaF_smooth * 4;
-            etaF = 0.9 / (LipF + eps);
+            if opts.use_lowfreq_F_basis
+                LipQ = norm(BtB, 2) * norm(HHt, 2);
+                if opts.lambdaF_smooth > 0
+                    LipQ = LipQ + opts.lambdaF_smooth * norm(HfDtDHfT, 2);
+                end
+                LipQ = LipQ + opts.lambdaF_q_l2;
+                etaQ = 0.9 / (LipQ + eps);
+            else
+                % LipF ~ ||B'B||_2 + lambdaF*||DtD||_2
+                LipF = norm(BtB, 2) + opts.lambdaF_smooth * 4;
+                etaF = 0.9 / (LipF + eps);
+            end
         end
     else
         etaC = opts.etaC;
         etaF = opts.etaF;
+        etaQ = opts.etaF;
     end
 
     % =========================
@@ -194,26 +223,58 @@ for it = 1:opts.maxIter
     % (2) Update F (background temporal, projected gradient + smoothness)
     % =========================
     if use_background
-        for s = 1:opts.innerF
-            % grad wrt F: B'*(A*C + B*F - X) + lambdaF*(F*DtD)
-            R = (Aact*C + Bact*F) - X;
-            gradF = (Bact' * R) + opts.lambdaF_smooth * apply_DtD_right(F, DtD);
-            
-            Fnew = max(0, F - etaF * gradF);
+        if opts.use_lowfreq_F_basis
+            BtB = (Bact' * Bact) + opts.bg_eps * eye(r, 'like', Bact);
+            BR = Bact' * (X - Aact*C);
 
-            if opts.backtracking
-                [objOld] = objective_val(X, Aact, C, Bact, F, DtD, opts);
-                [objNew] = objective_val(X, Aact, C, Bact, Fnew, DtD, opts);
-                bt = 0;
-                while objNew > objOld && bt < opts.maxBacktrack
-                    etaF = etaF * 0.5;
-                    Fnew = max(0, F - etaF * gradF);
-                    objNew = objective_val(X, Aact, C, Bact, Fnew, DtD, opts);
-                    bt = bt + 1;
+            for s = 1:opts.innerF
+                gradQ = (BtB * q * HHt - BR * Hf');
+                if opts.lambdaF_smooth > 0
+                    gradQ = gradQ + opts.lambdaF_smooth * (q * HfDtDHfT);
                 end
-            end
+                if opts.lambdaF_q_l2 > 0
+                    gradQ = gradQ + opts.lambdaF_q_l2 * q;
+                end
 
-            F = Fnew;
+                qnew = max(0, q - etaQ * gradQ);
+
+                if opts.backtracking
+                    objOld = objective_val(X, Aact, C, Bact, q * Hf, DtD, opts);
+                    objNew = objective_val(X, Aact, C, Bact, qnew * Hf, DtD, opts);
+                    bt = 0;
+                    while objNew > objOld && bt < opts.maxBacktrack
+                        etaQ = etaQ * 0.5;
+                        qnew = max(0, q - etaQ * gradQ);
+                        objNew = objective_val(X, Aact, C, Bact, qnew * Hf, DtD, opts);
+                        bt = bt + 1;
+                    end
+                end
+
+                q = qnew;
+            end
+            F = q * Hf;
+        else
+            for s = 1:opts.innerF
+                % grad wrt F: B'*(A*C + B*F - X) + lambdaF*(F*DtD)
+                R = (Aact*C + Bact*F) - X;
+                gradF = (Bact' * R) + opts.lambdaF_smooth * apply_DtD_right(F, DtD);
+
+                Fnew = max(0, F - etaF * gradF);
+
+                if opts.backtracking
+                    [objOld] = objective_val(X, Aact, C, Bact, F, DtD, opts);
+                    [objNew] = objective_val(X, Aact, C, Bact, Fnew, DtD, opts);
+                    bt = 0;
+                    while objNew > objOld && bt < opts.maxBacktrack
+                        etaF = etaF * 0.5;
+                        Fnew = max(0, F - etaF * gradF);
+                        objNew = objective_val(X, Aact, C, Bact, Fnew, DtD, opts);
+                        bt = bt + 1;
+                    end
+                end
+
+                F = Fnew;
+            end
         end
 
         % Optional quantile-baseline anchoring (row-wise)
@@ -251,6 +312,11 @@ for it = 1:opts.maxIter
     end
 end
 
+if use_background && opts.use_lowfreq_F_basis
+    info.F_basis = Hf;
+    info.F_coeff = q;
+end
+
 end
 
 %% ======================================================================
@@ -264,6 +330,7 @@ function opts = set_default_opts(opts)
 
     def.lambdaC_smooth = 1e-4;
     def.lambdaF_smooth = 1e-2; % background should be very smooth
+    def.lambdaF_q_l2 = 0;      % optional ridge on q for F=q*Hf
 
     % Optional baseline anchoring for F)
     def.enforce_F_quantile_baseline = true; % whether to shift F after each update to keep a chosen quantile anchored
@@ -290,6 +357,10 @@ function opts = set_default_opts(opts)
 
     def.verbose = true;
     def.printEvery = 10;
+    def.use_lowfreq_F_basis = false;
+    def.F_basis_type = "dct";
+    def.F_basis_count = 12;
+    def.F_basis_fraction = 0.1;
 
     f = fieldnames(def);
     for i = 1:numel(f)
@@ -304,6 +375,30 @@ function opts = set_default_opts(opts)
     end
     opts.F_baseline_prctile = min(100, max(0, opts.F_baseline_prctile));
     opts.F_baseline_anchor_strength = min(1, max(0, opts.F_baseline_anchor_strength));
+end
+
+function Hf = build_temporal_basis(T, opts)
+% Build low-frequency temporal basis Hf (nBasis x T) for F = q*Hf.
+nb = round(opts.F_basis_count);
+if nb <= 0
+    nb = max(2, round(opts.F_basis_fraction * T));
+end
+nb = min(T, max(1, nb));
+
+basisType = lower(char(opts.F_basis_type));
+switch basisType
+    case 'dct'
+        C = dctmtx(T);
+        Hf = C(1:nb, :);
+    otherwise
+        error('Unsupported opts.F_basis_type: %s. Use "dct".', opts.F_basis_type);
+end
+end
+
+function q = project_F_to_basis(F, Hf, eps0)
+% Least-squares projection of F onto span(Hf): q = F*Hf'/(Hf*Hf').
+HHt = Hf * Hf';
+q = (F * Hf') / (HHt + eps0 * eye(size(HHt), 'like', HHt));
 end
 
 function obj = objective_val(X, A, C, B, F, DtD, opts)
