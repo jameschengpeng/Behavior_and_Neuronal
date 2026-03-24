@@ -1,4 +1,4 @@
-function [A, C, info] = custom_cnmf(X_dFF, H, W, K, mask, evt_domain_projection, opts)
+function [A, C, info] = custom_cnmf(X_data, H, W, K, mask, evt_domain_projection, opts)
 %CUSTOM_CNMF  CNMF-like factorization with OPTIONAL rank-1 background.
 %
 % Model (active pixels only):
@@ -6,8 +6,8 @@ function [A, C, info] = custom_cnmf(X_dFF, H, W, K, mask, evt_domain_projection,
 %
 % A: Pm x K  (spatial footprints, nonnegative)
 % C: K  x T  (time courses, nonnegative)
-% B: Pm x r  (background spatial profile, nonnegative)
-% F: r  x T  (background time course, nonnegative)
+% B: Pm x r  (background/global spatial profile, nonnegative)
+% F: r  x T  (background/global time course, nonnegative)
 %
 % Penalties (optional):
 %   - L1(A) sparsity (prox)
@@ -21,23 +21,20 @@ function [A, C, info] = custom_cnmf(X_dFF, H, W, K, mask, evt_domain_projection,
 if nargin < 7, opts = struct(); end
 opts = set_default_opts(opts);
 
-[P, T] = size(X_dFF);
-assert(P == H*W, 'X_dFF must have P=H*W rows.');
+[P, T] = size(X_data);
+assert(P == H*W, 'X_data must have P=H*W rows.');
 mask = reshape(mask, [], 1) ~= 0;
 assert(numel(mask) == P, 'mask must be HxW or P-vector.');
 
 % Active pixels only (tissue)
 idx = find(mask);
 Pm  = numel(idx);
-Xraw = double(X_dFF(idx, :));
+Xraw = double(X_data(idx, :));
 
 % use the AQuA2 detected events' projection as a guide to CNMF
 guide_full = reshape(evt_domain_projection, [], 1);
 guide_act  = double(guide_full(idx));
 guide_act  = guide_act / (max(guide_act) + eps);  % normalize to [0,1]
-
-
-
 
 % Nonnegativity handling for X (IMPORTANT: avoid double-shifting)
 X = Xraw;
@@ -66,17 +63,6 @@ end
 % Temporal smoothness operator D'D (T x T)
 DtD = build_DtD(T);
 
-% Optional low-frequency basis for background F: F = q * Hf
-if opts.use_lowfreq_F_basis && opts.use_background
-    Hf = build_temporal_basis(T, opts);     % nBasis x T
-    HHt = Hf * Hf';                         % nBasis x nBasis
-    HfDtDHfT = Hf * DtD * Hf';              % nBasis x nBasis
-else
-    Hf = [];
-    HHt = [];
-    HfDtDHfT = [];
-end
-
 % ---------------------------
 % Initialization
 % ---------------------------
@@ -86,25 +72,21 @@ rng(opts.seed);
 r = opts.bg_rank;
 
 if opts.use_background
-    bgopts = struct();
-    bgopts.bg_rank = r;
-    bgopts.use_quiet_init = true;
-    bgopts.quiet_prctile = opts.bg_quiet_prctile;
-    bgopts.n_refine = 1;
-    bgopts.nonneg_mode = "clip";
-    bgopts.eps0 = opts.bg_eps;
-    [B, F] = init_background_lowrank(X, bgopts);   % B: Pm x r, F: r x T
-    if opts.use_lowfreq_F_basis
-        q = project_F_to_basis(F, Hf, opts.bg_eps); % r x nBasis
-        q = max(q, 0);
-        F = q * Hf;
+    if opts.bg_init_mode == "pc1_global"
+        [B, F] = init_background_pc1_global(X, r, opts);
     else
-        q = [];
+        bgopts = struct();
+        bgopts.bg_rank = r;
+        bgopts.use_quiet_init = true;
+        bgopts.quiet_prctile = opts.bg_quiet_prctile;
+        bgopts.n_refine = 1;
+        bgopts.nonneg_mode = "clip";
+        bgopts.eps0 = opts.bg_eps;
+        [B, F] = init_background_lowrank(X, bgopts);   % B: Pm x r, F: r x T
     end
 else
     B = zeros(Pm, 0);
     F = zeros(0, T);
-    q = [];
 end
 
 % Optional baseline anchoring for F during training.
@@ -125,26 +107,7 @@ end
 % Residual for component init
 Xr = X - B*F;
 Xr = max(Xr, 0);  % keep nonnegativity
-
-try
-    [U,S,V] = svds(Xr, K);
-catch
-    [U,S,V] = svd(Xr, 'econ');
-    U = U(:,1:K); S = S(1:K,1:K); V = V(:,1:K);
-end
-
-% SVD sign is ambiguous: (u,v) and (-u,-v) are equivalent.
-% Enforce deterministic sign so each spatial mode tends to be positive
-% before nonnegative projection, reducing dead init columns in A.
-for k = 1:K
-    if sum(U(:,k)) < 0
-        U(:,k) = -U(:,k);
-        V(:,k) = -V(:,k);
-    end
-end
-
-Aact = max(0, U * sqrt(S));
-C    = max(0, (sqrt(S) * V'));
+[Aact, C, init_info] = init_AC_from_event_projection(Xr, evt_domain_projection, reshape(mask, H, W), K, opts);
 
 % this block is for checking the initialization of spatial footprints
 A_init = zeros(size(mask, 1), K);
@@ -167,6 +130,7 @@ end
 info.obj    = zeros(opts.maxIter,1);
 info.relchg = zeros(opts.maxIter,1);
 info.relRecon = zeros(opts.maxIter,1);
+info.init = init_info;
 
 % ---------------------------
 % Main loop
@@ -234,105 +198,77 @@ for it = 1:opts.maxIter
     end
 
     % =========================
-    % (2) Update background (B,F) by closed-form NNLS (rank-1)
+    % (2) Update background/global term
     % =========================
     if opts.use_background
-        Xpos = max(X,0);
-        g = mean(Xpos, 1);                       % global activity proxy
-    
-        % optional: high-pass to avoid slow drift dominating threshold
-        g_slow = movmedian(g, 201);
-        g_hp = g - g_slow;
-    
-        quiet_idx = g_hp <= prctile(g_hp, opts.bg_quiet_prctile);
-        if nnz(quiet_idx) < max(10, 2*r)
-            quiet_idx = true(1, T);
-        end
-    
         R0 = X - Aact*C;
-        R0pos = max(R0, 0);                      % <-- IMPORTANT: define it
-        R0q = R0pos(:, quiet_idx);               % <-- use consistent nonneg residual
-    
-        % ---- Update B using QUIET frames only
-        Fq  = F(:, quiet_idx);
-    
-        G   = (Fq * Fq');                        % r x r
-        RHS = (R0q * Fq');                       % Pm x r
-    
-        % Lipschitz bound for B: ||G||_2 + lambdaB*||L||_2, with ||L||_2 <= 2*dmax
-        LipL = 2 * opts.neighborhood;
-        LipB = norm(G, 2) + opts.lambdaB_lap * LipL;
-        etaB = 0.9 / (LipB + eps);
-    
-        for sB = 1:opts.innerB
-            gradB = (B * G - RHS) + opts.lambdaB_lap * (L * B);
-            B = max(0, B - etaB * gradB);
+        R0pos = max(R0, 0);
+
+        if opts.update_background
+            % ---- Optional B update on ALL frames using current F
+            G   = (F * F');
+            RHS = (R0pos * F');
+
+            % Lipschitz bound for B: ||F*F'||_2 + lambdaB*||L||_2
+            LipL = 2 * opts.neighborhood;
+            LipB = norm(G, 2) + opts.lambdaB_lap * LipL;
+            etaB = 0.9 / (LipB + eps);
+
+            for sB = 1:opts.innerB
+                gradB = (B * G - RHS) + opts.lambdaB_lap * (L * B);
+                B = max(0, B - etaB * gradB);
+            end
         end
-    
-        % ---- Update F on ALL frames using full residual (but B fixed)
-        BtB = (B' * B) + opts.bg_eps * eye(r);
-        BR  = (B' * R0pos);
 
-        if opts.use_lowfreq_F_basis
-            % Update q in F = q*Hf. This constrains F to low-frequency content.
-            if isempty(q)
-                q = project_F_to_basis(F, Hf, opts.bg_eps);
+        if opts.update_F
+            % ---- Update F on ALL frames using full residual (with B fixed)
+            BtB = (B' * B) + opts.bg_eps * eye(r);
+            BR  = (B' * R0pos);
+            use_nonovershoot_F = opts.enforce_background_nonovershoot && r == 1;
+            if use_nonovershoot_F
+                F_cap = fit_rank1_nonovershoot(B, R0, opts);
             end
 
-            LipQ = norm(BtB, 2) * norm(HHt, 2);
-            if opts.lambdaF_smooth > 0
-                LipQ = LipQ + opts.lambdaF_smooth * norm(HfDtDHfT, 2);
-            end
-            LipQ = LipQ + opts.lambdaF_q_l2;
-            etaQ = 0.9 / (LipQ + eps);
+            if opts.lambdaF_smooth > 0 && ~use_nonovershoot_F
+                % Solve: min_F 0.5||R0pos - B*F||_F^2 + 0.5*lambdaF*tr(F*DtD*F')
+                % via projected-gradient (nonnegative F)
+                LipF = norm(BtB, 2) + opts.lambdaF_smooth * 4;
+                etaF = 0.9 / (LipF + eps);
 
-            for sF = 1:opts.innerF
-                gradQ = (BtB * q * HHt - BR * Hf');
-                if opts.lambdaF_smooth > 0
-                    gradQ = gradQ + opts.lambdaF_smooth * (q * HfDtDHfT);
+                for sF = 1:opts.innerF
+                    gradF = (BtB * F - BR) + opts.lambdaF_smooth * (F * DtD);
+                    F = max(0, F - etaF * gradF);
                 end
-                if opts.lambdaF_q_l2 > 0
-                    gradQ = gradQ + opts.lambdaF_q_l2 * q;
-                end
-                q = max(0, q - etaQ * gradQ);
-            end
-            F = q * Hf;
-        elseif opts.lambdaF_smooth > 0
-            % Solve: min_F 0.5||R0pos - B*F||_F^2 + 0.5*lambdaF*tr(F*DtD*F')
-            % via projected-gradient (nonnegative F)
-            LipF = norm(BtB, 2) + opts.lambdaF_smooth * 4;
-            etaF = 0.9 / (LipF + eps);
-
-            for sF = 1:opts.innerF
-                gradF = (BtB * F - BR) + opts.lambdaF_smooth * (F * DtD);
-                F = max(0, F - etaF * gradF);
+            elseif use_nonovershoot_F
+                % In conservative rank-1 mode, use a noise-corrected lower-tail
+                % estimate of the shared floor instead of an average-error fit.
+                F = F_cap;
+            else
+                % Closed-form NNLS proxy when no temporal smoothing is requested
+                Lb = chol(BtB, 'lower');
+                F = Lb'\(Lb\BR);
+                F = max(F, 0);
             end
         else
-            % Closed-form NNLS proxy when no temporal smoothing is requested
-            Lb = chol(BtB, 'lower');
-            F = Lb'\(Lb\BR);
-            F = max(F, 0);
+            use_nonovershoot_F = false;
         end
     
         % Optional stabilization: normalize columns of B, rescale F
-        coln = sqrt(sum(B.^2,1)) + opts.bg_eps;
-        B = B ./ coln;
-        F = F .* coln';
-        if opts.use_lowfreq_F_basis && ~isempty(q)
-            q = q .* coln';
+        if opts.update_background
+            coln = sqrt(sum(B.^2,1)) + opts.bg_eps;
+            B = B ./ coln;
+            F = F .* coln';
         end
 
         % Optional quantile-baseline anchoring (row-wise) to prevent F drift.
-        if opts.enforce_F_quantile_baseline && ~isempty(F_quantile_ref_train)
+        if opts.update_F && opts.enforce_F_quantile_baseline && ~isempty(F_quantile_ref_train)
             q_cur = prctile(F, opts.F_baseline_prctile, 2);      % r x 1
             delta = cast(F_quantile_ref_train - q_cur, 'like', F);
-            F_anchor = max(0, F + opts.F_baseline_anchor_strength * (delta * ones(1, T, 'like', F)));
-            if opts.use_lowfreq_F_basis
-                q = max(0, project_F_to_basis(F_anchor, Hf, opts.bg_eps));
-                F = q * Hf;
-            else
-                F = F_anchor;
-            end
+            F = max(0, F + opts.F_baseline_anchor_strength * (delta * ones(1, T, 'like', F)));
+        end
+
+        if opts.update_F && use_nonovershoot_F && ~isempty(F)
+            F = min(F, F_cap);
         end
     end
 
@@ -512,7 +448,6 @@ for it = 1:opts.maxIter
             guide_obj = 0.5 * opts.lambdaA_guide * (remainder' * remainder);
         end
 
-
         % =========================
         % ---- Print ----
         % =========================
@@ -534,9 +469,6 @@ for it = 1:opts.maxIter
         disp('-----------')
     end
 
-
-
-
     % stopping
     if it >= opts.minIter && it > 1 && info.relchg(it) < opts.tol
         info.obj = info.obj(1:it);
@@ -554,10 +486,6 @@ A(idx, :) = Aact;
 info.B = zeros(P,size(B,2));
 info.B(idx, :) = B;
 info.F = F;
-if opts.use_lowfreq_F_basis
-    info.F_basis = Hf;
-    info.F_coeff = q;
-end
 
 end
 
@@ -622,29 +550,41 @@ end
 
 Xq = Xpos(:, quiet_idx);
 
-% SVD-based init on quiet frames (fast, robust)
-% If svds fails (e.g., rank too high), fall back to svd econ.
-try
-    [U,S,V] = svds(Xq, r);
-catch
-    [U,S,V] = svd(Xq, 'econ');
-    U = U(:, 1:r);
-    S = S(1:r, 1:r);
-    V = V(:, 1:r);
+% For rank-1 background, use a uniform spatial profile to represent a
+% biologically shared field-wide response rather than a data-adaptive mode.
+if r == 1
+    B = ones(Pm, 1);
+    B = B / (norm(B) + opts.eps0);
+    F = fit_rank1_nonovershoot(B, Xpos, opts); % 1 x T
+else
+    % SVD-based init on quiet frames for multi-rank backgrounds.
+    try
+        [U,S,~] = svds(Xq, r);
+    catch
+        [U,S,~] = svd(Xq, 'econ');
+        U = U(:, 1:r);
+        S = S(1:r, 1:r);
+    end
+
+    B = max(0, U * sqrt(S));      % Pm x r
+    BtB = (B' * B) + opts.eps0 * eye(r);
+    F = max(0, (BtB \ (B' * Xpos))); % r x T
 end
 
-B = max(0, U * sqrt(S));      % Pm x r
-% Lift to all frames by regression
-BtB = (B' * B) + opts.eps0 * eye(r);
-F = max(0, (BtB \ (B' * Xpos))); % r x T
-
-% Optional refinement (alternating NNLS-like closed forms + clipping)
+% Optional refinement:
+% keep B tied to quiet frames, then refit F on all frames.
 for k = 1:opts.n_refine
-    FFt = (F * F') + opts.eps0 * eye(r);
-    B = max(0, (Xpos * F') / FFt);    % Pm x r
+    if r == 1
+        % Keep the rank-1 global profile uniform; only refresh F.
+        F = fit_rank1_nonovershoot(B, Xpos, opts);  % 1 x T
+    else
+        Fq = F(:, quiet_idx);
+        FFt = (Fq * Fq') + opts.eps0 * eye(r);
+        B = max(0, (Xq * Fq') / FFt);      % Pm x r, quiet-frame only
 
-    BtB = (B' * B) + opts.eps0 * eye(r);
-    F = max(0, (BtB \ (B' * Xpos)));  % r x T
+        BtB = (B' * B) + opts.eps0 * eye(r);
+        F = max(0, (BtB \ (B' * Xpos)));  % r x T
+    end
 end
 
 % Normalize columns of B to reduce scale ambiguity
@@ -658,7 +598,56 @@ info = struct();
 info.quiet_idx = quiet_idx;
 info.Xpos = Xpos;
 info.recon_err = norm(Xpos - B*F, 'fro') / den;
+end
 
+function [B, F] = init_background_pc1_global(X, r, opts)
+% Initialize a global background mode from the first principal component.
+% B is inferred from the centered PC1 spatial loading and constrained
+% nonnegative. F is then fit conservatively so B*F does not exceed X.
+
+if r ~= 1
+    error('bg_init_mode="pc1_global" currently requires bg_rank = 1.');
+end
+
+X_for_bg = temporal_gaussian_smooth(X, opts.bg_pc1_temporal_sigma_frames);
+
+Xc = X_for_bg;
+if opts.bg_pc1_center
+    Xc = Xc - mean(Xc, 2);
+end
+
+try
+    [u, s, ~] = svds(Xc, 1);
+catch
+    [u, s, ~] = svd(Xc, 'econ');
+    u = u(:,1);
+    s = s(1,1);
+end
+
+if sum(u) < 0
+    u = -u;
+end
+
+b0 = u * sqrt(s);
+switch opts.bg_pc1_nonneg_mode
+    case "clip"
+        B = max(b0, 0);
+    case "shift"
+        B = b0 - min(b0);
+    otherwise
+        error('opts.bg_pc1_nonneg_mode must be "clip" or "shift".');
+end
+
+if all(B == 0)
+    B = abs(b0);
+end
+
+colnorm = sqrt(sum(B.^2, 1)) + opts.bg_eps;
+B = B ./ colnorm;
+
+% Fit a conservative temporal strength from the lower tail rather than a
+% projection fit, reducing immediate capture of localized signal.
+F = fit_rank1_nonovershoot(B, X, opts);
 end
 
 %% -----------------------
@@ -671,6 +660,8 @@ def.quiet_prctile = 20;
 def.n_refine = 1;
 def.nonneg_mode = "none"; % safest for dF/F init
 def.eps0 = 1e-12;
+def.bg_floor_quantile = 0.05;
+def.bg_floor_noise_sigma = [];
 
 f = fieldnames(def);
 for i = 1:numel(f)
@@ -683,6 +674,10 @@ end
 opts.bg_rank = max(1, round(opts.bg_rank));
 opts.quiet_prctile = min(50, max(1, opts.quiet_prctile));
 opts.n_refine = max(0, round(opts.n_refine));
+if opts.bg_floor_quantile > 1
+    opts.bg_floor_quantile = opts.bg_floor_quantile / 100;
+end
+opts.bg_floor_quantile = min(0.49, max(0.001, opts.bg_floor_quantile));
 end
 
 
@@ -706,8 +701,10 @@ function opts = set_default_opts(opts)
     def.compact_eps = 1e-12;
     def.compact_norm_coords = true;
     def.lambdaC_smooth = 1e-4;
-    def.lambdaF_smooth = 1e-2; % background should be very smooth (often >= lambdaC_smooth)
-    def.lambdaF_q_l2 = 0;      % optional ridge on q for F=q*Hf
+    def.lambdaF_smooth = 1e-2; % global/background temporal smoothness
+    def.enforce_background_nonovershoot = false;
+    def.bg_floor_quantile = 0.05;
+    def.bg_floor_noise_sigma = [];
     def.enforce_F_quantile_baseline = false;
     def.F_baseline_prctile = 5;
     def.F_quantile_ref = [];
@@ -715,11 +712,18 @@ function opts = set_default_opts(opts)
     def.lambdaB_lap = 5e-3;   % start ~ 5–20x lambdaA_lap
     def.innerB = 3;           % how many gradient steps for B
     def.innerF = 3;           % how many projected-gradient steps for F
+    def.update_F = true;
 
     % the guide from AQuA2 events' projections
     def.lambdaA_guide = 0;        % guide strength (OFF by default)
     def.use_guide_scale = true;   % compute beta each iter
     def.guide_eps = 1e-12;
+    def.init_evt_sigma = 8;
+    def.init_evt_min_peak_dist = 200;
+    def.init_evt_min_frac = 0.10;
+    def.init_evt_max_frac = 0.30;
+    def.init_evt_threshold_levels = 40;
+    def.init_evt_ridge = 1e-6;
 
     def.etaA = 1e-3;
     def.etaC = 1e-3;
@@ -740,11 +744,11 @@ function opts = set_default_opts(opts)
     def.use_background = true;
     def.bg_rank = 3;
     def.bg_eps = 1e-12;          % small ridge for SPD solves
-    def.bg_quiet_prctile = 20;   % for init (optional)
-    def.use_lowfreq_F_basis = false;
-    def.F_basis_type = "dct";
-    def.F_basis_count = 12;
-    def.F_basis_fraction = 0.1;
+    def.bg_init_mode = "lowrank"; % "lowrank" or "pc1_global"
+    def.update_background = true;
+    def.bg_pc1_center = true;
+    def.bg_pc1_nonneg_mode = "clip";
+    def.bg_pc1_temporal_sigma_frames = 10;
 
     % NEW: backtracking safeguard
     def.backtracking = true;
@@ -764,37 +768,16 @@ function opts = set_default_opts(opts)
     end
 
     % Guardrail for quiet frame percentile used by background updates
-    opts.bg_quiet_prctile = min(50, max(1, opts.bg_quiet_prctile));
     opts.normalize_prctile = min(100, max(50, opts.normalize_prctile));
+    if opts.bg_floor_quantile > 1
+        opts.bg_floor_quantile = opts.bg_floor_quantile / 100;
+    end
+    opts.bg_floor_quantile = min(0.49, max(0.001, opts.bg_floor_quantile));
     if opts.F_baseline_prctile <= 1
         opts.F_baseline_prctile = 100 * opts.F_baseline_prctile;
     end
     opts.F_baseline_prctile = min(100, max(0, opts.F_baseline_prctile));
     opts.F_baseline_anchor_strength = min(1, max(0, opts.F_baseline_anchor_strength));
-end
-
-function Hf = build_temporal_basis(T, opts)
-% Build low-frequency temporal basis Hf (nBasis x T) for F = q*Hf.
-nb = round(opts.F_basis_count);
-if nb <= 0
-    nb = max(2, round(opts.F_basis_fraction * T));
-end
-nb = min(T, max(1, nb));
-
-basisType = lower(char(opts.F_basis_type));
-switch basisType
-    case 'dct'
-        C = dctmtx(T);
-        Hf = C(1:nb, :);
-    otherwise
-        error('Unsupported opts.F_basis_type: %s. Use "dct".', opts.F_basis_type);
-end
-end
-
-function q = project_F_to_basis(F, Hf, eps0)
-% Least-squares projection of F onto span(Hf): q = F*Hf'/(Hf*Hf').
-HHt = Hf * Hf';
-q = (F * Hf') / (HHt + eps0 * eye(size(HHt), 'like', HHt));
 end
 %%
 function obj = objective_val(X, A, C, B, F, L, DtD, opts, guide_act, row_act, col_act)
@@ -942,4 +925,21 @@ function [A, C] = normalize_factors(A, C, opts)
 
     A = A ./ scale;
     C = C .* scale';
+end
+
+function Xs = temporal_gaussian_smooth(X, sigma_frames)
+if sigma_frames <= 0
+    Xs = X;
+    return;
+end
+
+half_width = max(1, ceil(3 * sigma_frames));
+t = -half_width:half_width;
+kernel = exp(-(t.^2) / (2 * sigma_frames^2));
+kernel = kernel / sum(kernel);
+
+left_pad = repmat(X(:,1), 1, half_width);
+right_pad = repmat(X(:,end), 1, half_width);
+X_pad = [left_pad, X, right_pad];
+Xs = conv2(X_pad, kernel, 'valid');
 end

@@ -1,5 +1,5 @@
-function [C, F, info] = infer_CF_fixed_AB(X_dFF, A_full, B_full, H, W, mask, opts)
-%INFER_CF_FIXED_AB  Infer temporal components C and F given fixed spatial components A and B.
+function [C, F, info] = infer_CF_fixed_AB(X_data, A_full, B_full, H, W, mask, opts)
+% INFER_CF_FIXED_AB  Infer temporal components C and F given fixed spatial components A and B.
 %
 % Model (active pixels only):
 %   X ~= A*C + B*F
@@ -14,7 +14,7 @@ function [C, F, info] = infer_CF_fixed_AB(X_dFF, A_full, B_full, H, W, mask, opt
 %   - Temporal smoothness on F: 0.5*lambdaF_smooth * tr(F DtD F')
 %
 % Inputs:
-%   X_dFF : P x T matrix (can be reshaped time-lapse data)
+%   X_data : P x T matrix (can be reshaped time-lapse data)
 %   A_full: P x K matrix (pre-fitted spatial components, full image size)
 %   B_full: P x r matrix (pre-fitted background spatial, full image size)
 %           - If empty [] or not provided, no background is used
@@ -38,8 +38,8 @@ if isfield(opts, 'use_background')
     use_background = logical(opts.use_background) && ~isempty(B_full);
 end
 
-[P, T] = size(X_dFF);
-assert(P == H*W, 'X_dFF must have P=H*W rows.');
+[P, T] = size(X_data);
+assert(P == H*W, 'X_data must have P=H*W rows.');
 assert(size(A_full, 1) == P, 'A_full must have P rows.');
 if use_background
     assert(size(B_full, 1) == P, 'B_full must have P rows.');
@@ -53,7 +53,7 @@ K = size(A_full, 2);
 % Active pixels only (tissue)
 idx = find(mask);
 Pm  = numel(idx);
-Xraw = X_dFF(idx, :);
+Xraw = X_data(idx, :);
 
 % Nonnegativity handling for X
 X = Xraw;
@@ -103,17 +103,6 @@ if isa(X, 'single')
     end
 end
 
-% Optional low-frequency basis for background F: F = q * Hf
-if use_background && opts.use_lowfreq_F_basis
-    Hf = build_temporal_basis(T, opts);     % nBasis x T
-    HHt = Hf * Hf';                         % nBasis x nBasis
-    HfDtDHfT = Hf * DtD * Hf';              % nBasis x nBasis
-else
-    Hf = [];
-    HHt = [];
-    HfDtDHfT = [];
-end
-
 % ---------------------------
 % Initialization
 % ---------------------------
@@ -121,25 +110,29 @@ rng(opts.seed);
 
 % Initialize C using NNLS with small ridge for stability
 if use_background
-    % Solve: min ||X - A*C - B*F||^2 for C, F jointly (alternating init)
-    % Start with F = 0
-    F = zeros(r, T);
-    AAt = Aact' * Aact + opts.bg_eps * eye(K, 'like', Aact);
-    AtX = Aact' * X;
-    C = AAt \ AtX;  % K x T
-    C = max(C, 0);
-    
-    % Then update F given C
-    BtB = Bact' * Bact + opts.bg_eps * eye(r, 'like', Bact);
-    BtR = Bact' * (X - Aact*C);
-    F = BtB \ BtR;  % r x T
-    F = max(F, 0);
-    if opts.use_lowfreq_F_basis
-        q = project_F_to_basis(F, Hf, opts.bg_eps);
-        q = max(q, 0);
-        F = q * Hf;
+    use_nonovershoot_init = opts.enforce_background_nonovershoot && (r == 1);
+
+    if use_nonovershoot_init
+        F = fit_rank1_nonovershoot(Bact, X, opts);
+
+        AAt = Aact' * Aact + opts.bg_eps * eye(K, 'like', Aact);
+        AtR = Aact' * (X - Bact*F);
+        C = AAt \ AtR;  % K x T
+        C = max(C, 0);
     else
-        q = [];
+        % Solve: min ||X - A*C - B*F||^2 for C, F jointly (alternating init)
+        % Start with F = 0
+        F = zeros(r, T, 'like', X);
+        AAt = Aact' * Aact + opts.bg_eps * eye(K, 'like', Aact);
+        AtX = Aact' * X;
+        C = AAt \ AtX;  % K x T
+        C = max(C, 0);
+
+        % Then update F given C
+        BtB = Bact' * Bact + opts.bg_eps * eye(r, 'like', Bact);
+        BtR = Bact' * (X - Aact*C);
+        F = BtB \ BtR;  % r x T
+        F = max(F, 0);
     end
 else
     % No background: simple NNLS
@@ -148,7 +141,6 @@ else
     C = AAt \ AtX;  % K x T
     C = max(C, 0);
     F = zeros(0, T);
-    q = [];
 end
 
 % For fixed-A inference, a dead component can be valid (absent in this split).
@@ -172,25 +164,15 @@ for it = 1:opts.maxIter
         LipC = norm(AAt, 2) + opts.lambdaC_smooth * 4;
         etaC = 0.9 / (LipC + eps);
         
-        if use_background
+        if use_background && opts.update_F
             BtB = Bact' * Bact;              % r x r
-            if opts.use_lowfreq_F_basis
-                LipQ = norm(BtB, 2) * norm(HHt, 2);
-                if opts.lambdaF_smooth > 0
-                    LipQ = LipQ + opts.lambdaF_smooth * norm(HfDtDHfT, 2);
-                end
-                LipQ = LipQ + opts.lambdaF_q_l2;
-                etaQ = 0.9 / (LipQ + eps);
-            else
-                % LipF ~ ||B'B||_2 + lambdaF*||DtD||_2
-                LipF = norm(BtB, 2) + opts.lambdaF_smooth * 4;
-                etaF = 0.9 / (LipF + eps);
-            end
+            % LipF ~ ||B'B||_2 + lambdaF*||DtD||_2
+            LipF = norm(BtB, 2) + opts.lambdaF_smooth * 4;
+            etaF = 0.9 / (LipF + eps);
         end
     else
         etaC = opts.etaC;
         etaF = opts.etaF;
-        etaQ = opts.etaF;
     end
 
     % =========================
@@ -222,59 +204,27 @@ for it = 1:opts.maxIter
     % =========================
     % (2) Update F (background temporal, projected gradient + smoothness)
     % =========================
-    if use_background
-        if opts.use_lowfreq_F_basis
-            BtB = (Bact' * Bact) + opts.bg_eps * eye(r, 'like', Bact);
-            BR = Bact' * (X - Aact*C);
+    if use_background && opts.update_F
+        for s = 1:opts.innerF
+            % grad wrt F: B'*(A*C + B*F - X) + lambdaF*(F*DtD)
+            R = (Aact*C + Bact*F) - X;
+            gradF = (Bact' * R) + opts.lambdaF_smooth * apply_DtD_right(F, DtD);
 
-            for s = 1:opts.innerF
-                gradQ = (BtB * q * HHt - BR * Hf');
-                if opts.lambdaF_smooth > 0
-                    gradQ = gradQ + opts.lambdaF_smooth * (q * HfDtDHfT);
+            Fnew = max(0, F - etaF * gradF);
+
+            if opts.backtracking
+                [objOld] = objective_val(X, Aact, C, Bact, F, DtD, opts);
+                [objNew] = objective_val(X, Aact, C, Bact, Fnew, DtD, opts);
+                bt = 0;
+                while objNew > objOld && bt < opts.maxBacktrack
+                    etaF = etaF * 0.5;
+                    Fnew = max(0, F - etaF * gradF);
+                    objNew = objective_val(X, Aact, C, Bact, Fnew, DtD, opts);
+                    bt = bt + 1;
                 end
-                if opts.lambdaF_q_l2 > 0
-                    gradQ = gradQ + opts.lambdaF_q_l2 * q;
-                end
-
-                qnew = max(0, q - etaQ * gradQ);
-
-                if opts.backtracking
-                    objOld = objective_val(X, Aact, C, Bact, q * Hf, DtD, opts);
-                    objNew = objective_val(X, Aact, C, Bact, qnew * Hf, DtD, opts);
-                    bt = 0;
-                    while objNew > objOld && bt < opts.maxBacktrack
-                        etaQ = etaQ * 0.5;
-                        qnew = max(0, q - etaQ * gradQ);
-                        objNew = objective_val(X, Aact, C, Bact, qnew * Hf, DtD, opts);
-                        bt = bt + 1;
-                    end
-                end
-
-                q = qnew;
             end
-            F = q * Hf;
-        else
-            for s = 1:opts.innerF
-                % grad wrt F: B'*(A*C + B*F - X) + lambdaF*(F*DtD)
-                R = (Aact*C + Bact*F) - X;
-                gradF = (Bact' * R) + opts.lambdaF_smooth * apply_DtD_right(F, DtD);
 
-                Fnew = max(0, F - etaF * gradF);
-
-                if opts.backtracking
-                    [objOld] = objective_val(X, Aact, C, Bact, F, DtD, opts);
-                    [objNew] = objective_val(X, Aact, C, Bact, Fnew, DtD, opts);
-                    bt = 0;
-                    while objNew > objOld && bt < opts.maxBacktrack
-                        etaF = etaF * 0.5;
-                        Fnew = max(0, F - etaF * gradF);
-                        objNew = objective_val(X, Aact, C, Bact, Fnew, DtD, opts);
-                        bt = bt + 1;
-                    end
-                end
-
-                F = Fnew;
-            end
+            F = Fnew;
         end
 
         % Optional quantile-baseline anchoring (row-wise)
@@ -312,11 +262,6 @@ for it = 1:opts.maxIter
     end
 end
 
-if use_background && opts.use_lowfreq_F_basis
-    info.F_basis = Hf;
-    info.F_coeff = q;
-end
-
 end
 
 %% ======================================================================
@@ -330,7 +275,9 @@ function opts = set_default_opts(opts)
 
     def.lambdaC_smooth = 1e-4;
     def.lambdaF_smooth = 1e-2; % background should be very smooth
-    def.lambdaF_q_l2 = 0;      % optional ridge on q for F=q*Hf
+    def.enforce_background_nonovershoot = false;
+    def.bg_floor_quantile = 0.05;
+    def.bg_floor_noise_sigma = [];
 
     % Optional baseline anchoring for F)
     def.enforce_F_quantile_baseline = true; % whether to shift F after each update to keep a chosen quantile anchored
@@ -345,6 +292,7 @@ function opts = set_default_opts(opts)
 
     def.innerC = 1;
     def.innerF = 1;  % similar to innerC
+    def.update_F = true;
 
     def.seed = 0;
     def.bg_eps = 1e-12;
@@ -357,10 +305,6 @@ function opts = set_default_opts(opts)
 
     def.verbose = true;
     def.printEvery = 10;
-    def.use_lowfreq_F_basis = false;
-    def.F_basis_type = "dct";
-    def.F_basis_count = 12;
-    def.F_basis_fraction = 0.1;
 
     f = fieldnames(def);
     for i = 1:numel(f)
@@ -369,36 +313,17 @@ function opts = set_default_opts(opts)
         end
     end
 
+    if opts.bg_floor_quantile > 1
+        opts.bg_floor_quantile = opts.bg_floor_quantile / 100;
+    end
+    opts.bg_floor_quantile = min(0.49, max(0.001, opts.bg_floor_quantile));
+
     % Accept either fraction (0-1) or percentile (0-100)
     if opts.F_baseline_prctile <= 1
         opts.F_baseline_prctile = 100 * opts.F_baseline_prctile;
     end
     opts.F_baseline_prctile = min(100, max(0, opts.F_baseline_prctile));
     opts.F_baseline_anchor_strength = min(1, max(0, opts.F_baseline_anchor_strength));
-end
-
-function Hf = build_temporal_basis(T, opts)
-% Build low-frequency temporal basis Hf (nBasis x T) for F = q*Hf.
-nb = round(opts.F_basis_count);
-if nb <= 0
-    nb = max(2, round(opts.F_basis_fraction * T));
-end
-nb = min(T, max(1, nb));
-
-basisType = lower(char(opts.F_basis_type));
-switch basisType
-    case 'dct'
-        C = dctmtx(T);
-        Hf = C(1:nb, :);
-    otherwise
-        error('Unsupported opts.F_basis_type: %s. Use "dct".', opts.F_basis_type);
-end
-end
-
-function q = project_F_to_basis(F, Hf, eps0)
-% Least-squares projection of F onto span(Hf): q = F*Hf'/(Hf*Hf').
-HHt = Hf * Hf';
-q = (F * Hf') / (HHt + eps0 * eye(size(HHt), 'like', HHt));
 end
 
 function obj = objective_val(X, A, C, B, F, DtD, opts)
