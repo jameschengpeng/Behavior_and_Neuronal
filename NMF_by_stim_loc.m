@@ -317,6 +317,7 @@ for ii = 1:length(videos_test)
 end
 
 [A_upper, C_upper_train, info_upper_train] = custom_cnmf(X_data(:, time_train), H, W, k_nmf_comp, mask_upper_half, evt_domain_projection, opts);
+%%
 [A_lower, C_lower_train, info_lower_train] = custom_cnmf(X_data(:, time_train), H, W, k_nmf_comp, mask_lower_half, evt_domain_projection, opts);
 
 %% show the training outcome
