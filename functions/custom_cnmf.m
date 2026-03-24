@@ -29,15 +29,14 @@ assert(numel(mask) == P, 'mask must be HxW or P-vector.');
 % Active pixels only (tissue)
 idx = find(mask);
 Pm  = numel(idx);
-Xraw = double(X_data(idx, :));
+X = double(X_data(idx, :));
 
 % use the AQuA2 detected events' projection as a guide to CNMF
-guide_full = reshape(evt_domain_projection, [], 1);
-guide_act  = double(guide_full(idx));
+evt_domain_projection = reshape(evt_domain_projection, [], 1);
+guide_act  = double(evt_domain_projection(idx));
 guide_act  = guide_act / (max(guide_act) + eps);  % normalize to [0,1]
 
 % Nonnegativity handling for X (IMPORTANT: avoid double-shifting)
-X = Xraw;
 if opts.nonneg_mode == "shift"
     X = X - min(X(:));
 elseif opts.nonneg_mode == "clip"
@@ -108,11 +107,13 @@ end
 Xr = X - B*F;
 Xr = max(Xr, 0);  % keep nonnegativity
 [Aact, C, init_info] = init_AC_from_event_projection(Xr, evt_domain_projection, reshape(mask, H, W), K, opts);
+clear Xr
 
 % this block is for checking the initialization of spatial footprints
 A_init = zeros(size(mask, 1), K);
 A_init(idx, :) = Aact;
 A_init_comb = reshape(sum(A_init, 2), [H, W]);
+clear mask
 
 % Reinit any dead components
 for k = 1:K
@@ -131,6 +132,7 @@ info.obj    = zeros(opts.maxIter,1);
 info.relchg = zeros(opts.maxIter,1);
 info.relRecon = zeros(opts.maxIter,1);
 info.init = init_info;
+clear init_info
 
 % ---------------------------
 % Main loop
@@ -140,8 +142,7 @@ prevObj = inf;
 for it = 1:opts.maxIter
 
     % ---- Compute residual with current background
-    Xhat = Aact*C + B*F;
-    R = Xhat - X;
+    R = (Aact*C + B*F) - X;
 
     % ===== Step sizes (with safer spectral-norm estimates)
     if opts.use_adaptive_steps
@@ -201,8 +202,8 @@ for it = 1:opts.maxIter
     % (2) Update background/global term
     % =========================
     if opts.use_background
-        R0 = X - Aact*C;
-        R0pos = max(R0, 0);
+        AX = Aact*C;
+        R0pos = max(X - AX, 0);
 
         if opts.update_background
             % ---- Optional B update on ALL frames using current F
@@ -226,7 +227,9 @@ for it = 1:opts.maxIter
             BR  = (B' * R0pos);
             use_nonovershoot_F = opts.enforce_background_nonovershoot && r == 1;
             if use_nonovershoot_F
+                R0 = X - AX;
                 F_cap = fit_rank1_nonovershoot(B, R0, opts);
+                clear R0
             end
 
             if opts.lambdaF_smooth > 0 && ~use_nonovershoot_F
@@ -264,12 +267,14 @@ for it = 1:opts.maxIter
         if opts.update_F && opts.enforce_F_quantile_baseline && ~isempty(F_quantile_ref_train)
             q_cur = prctile(F, opts.F_baseline_prctile, 2);      % r x 1
             delta = cast(F_quantile_ref_train - q_cur, 'like', F);
-            F = max(0, F + opts.F_baseline_anchor_strength * (delta * ones(1, T, 'like', F)));
+            F = max(0, F + opts.F_baseline_anchor_strength * delta);
         end
 
         if opts.update_F && use_nonovershoot_F && ~isempty(F)
             F = min(F, F_cap);
         end
+
+        clear AX R0pos
     end
 
     % =========================
@@ -285,7 +290,7 @@ for it = 1:opts.maxIter
 
         if opts.lambdaA_excl > 0
             sumA = sum(Aact, 2);
-            gradExcl = (sumA * ones(1,K)) - Aact;
+            gradExcl = sumA - Aact;
             gradA = gradA + opts.lambdaA_excl * gradExcl;
         end
 
@@ -306,7 +311,7 @@ for it = 1:opts.maxIter
                 beta = 1;
             end
             
-            gradGuide = opts.lambdaA_guide * ((Aact_sum - beta * g) * ones(1,K));
+            gradGuide = opts.lambdaA_guide * (Aact_sum - beta * g);
             
             gradA = gradA + gradGuide;
         end
@@ -379,7 +384,7 @@ for it = 1:opts.maxIter
         gradA_excl = zeros(size(Aact));
         if opts.lambdaA_excl > 0
             sumA = sum(Aact, 2);
-            gradA_excl = opts.lambdaA_excl * ((sumA * ones(1,size(Aact,2))) - Aact);
+            gradA_excl = opts.lambdaA_excl * (sumA - Aact);
         end
 
         gradA_compact = zeros(size(Aact));
@@ -444,7 +449,7 @@ for it = 1:opts.maxIter
                 beta = 1;
             end
             remainder = Aact_sum - beta*g;
-            grad_guide = opts.lambdaA_guide * (remainder * ones(1,K));
+            grad_guide = opts.lambdaA_guide * remainder;
             guide_obj = 0.5 * opts.lambdaA_guide * (remainder' * remainder);
         end
 
@@ -724,6 +729,7 @@ function opts = set_default_opts(opts)
     def.init_evt_max_frac = 0.30;
     def.init_evt_threshold_levels = 40;
     def.init_evt_ridge = 1e-6;
+    def.AC_init_mode = "event_projection";
 
     def.etaA = 1e-3;
     def.etaC = 1e-3;
@@ -769,6 +775,7 @@ function opts = set_default_opts(opts)
 
     % Guardrail for quiet frame percentile used by background updates
     opts.normalize_prctile = min(100, max(50, opts.normalize_prctile));
+    opts.AC_init_mode = string(opts.AC_init_mode);
     if opts.bg_floor_quantile > 1
         opts.bg_floor_quantile = opts.bg_floor_quantile / 100;
     end

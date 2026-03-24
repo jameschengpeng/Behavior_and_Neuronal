@@ -233,7 +233,7 @@ opts.tol       = 0.03;
 % =====================
 % Spatial penalties
 % =====================
-opts.lambdaA_L1   = 80;     % sparcity constraint
+opts.lambdaA_L1   = 60;     % sparcity constraint
 opts.lambdaA_lap  = 2e3;     % smooth contiguous regions
 opts.lambdaA_excl = 5e2;        % OFF initially (overlap is allowed)
 opts.lambdaA_guide = 0;
@@ -318,10 +318,13 @@ end
 
 [A_upper, C_upper_train, info_upper_train] = custom_cnmf(X_data(:, time_train), H, W, k_nmf_comp, mask_upper_half, evt_domain_projection, opts);
 %%
+opts.AC_init_mode = "svd";
+opts.lambdaA_L1 = 50;
 [A_lower, C_lower_train, info_lower_train] = custom_cnmf(X_data(:, time_train), H, W, k_nmf_comp, mask_lower_half, evt_domain_projection, opts);
 
 %% show the training outcome
 plot_nmf_components_with_ethogram([A_upper A_lower], [C_upper_train; C_lower_train], etho_mat_all(time_train, :), 40, H, W)
+plot_nmf_components_with_ethogram([info_upper_train.B info_lower_train.B], [info_upper_train.F; info_lower_train.F], etho_mat_all(time_train, :), 40, H, W)
 
 %%
 A_upper = single(A_upper);

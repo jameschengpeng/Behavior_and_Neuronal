@@ -14,6 +14,14 @@ mask_img = reshape(mask, H, W) ~= 0;
 idx = find(mask_img(:));
 assert(numel(idx) == Pm, 'mask and Xr size mismatch in init_AC_from_event_projection.');
 
+if opts.AC_init_mode == "svd"
+    [Aact, C] = svd_fallback_init(Xr, K, opts.init_evt_ridge);
+    info = struct('mode', 'svd', 'centers_rc', []);
+    return;
+elseif opts.AC_init_mode ~= "event_projection"
+    error('opts.AC_init_mode must be "event_projection" or "svd".');
+end
+
 guide = double(evt_domain_projection);
 guide(~mask_img) = 0;
 
@@ -224,6 +232,7 @@ C = max(0, AAt \ (Aact' * Xr));
 end
 
 function opts = set_default_opts(opts)
+def.AC_init_mode = "event_projection";
 def.init_evt_sigma = 8;
 def.init_evt_min_peak_dist = 200;
 def.init_evt_min_frac = 0.10;
@@ -238,6 +247,7 @@ for i = 1:numel(f)
     end
 end
 
+opts.AC_init_mode = string(opts.AC_init_mode);
 opts.init_evt_sigma = max(0, opts.init_evt_sigma);
 opts.init_evt_min_peak_dist = max(1, round(opts.init_evt_min_peak_dist));
 opts.init_evt_min_frac = min(1, max(0, opts.init_evt_min_frac));
