@@ -4,8 +4,8 @@ addpath(genpath('C:\Users\james\CBIL\Astrocyte\scalable_calcium_model_prev'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 
 %%
-% preprocessed_storage_path = "F:\Mouse_behavior_data\D21\preprocessed_data"; further_smoothing = false;
-preprocessed_storage_path = "F:\CCK_PilotData_Baseline\preprocessed_data"; further_smoothing = true;
+preprocessed_storage_path = "F:\Mouse_behavior_data\D21\preprocessed_data"; further_smoothing = false;
+% preprocessed_storage_path = "F:\CCK_PilotData_Baseline\preprocessed_data"; further_smoothing = true;
 
 stim_side = "L";
 
@@ -111,6 +111,7 @@ plot(mean(X_data, 1))
 % for quality control purpose, only select events with medium size
 % no need to consider global events, or events that are too minor
 evt_domain_projection = zeros(H, W);
+evt_weight_tau = 3; % exponential weighting time constant in frames; smaller values emphasize earlier-recruited pixels more strongly
 conn = bwconncomp(evt_all, 6);
 for ii = 1:conn.NumObjects
     indices = conn.PixelIdxList{ii};
@@ -118,10 +119,16 @@ for ii = 1:conn.NumObjects
     xx_select = xx(zz==mode(zz)); % the largest spatial domain of this evt
     yy_select = yy(zz==mode(zz)); % the largest spatial domain of this evt
     ind_2d = sub2ind([H, W], xx_select, yy_select);
-    if numel(ind_2d) < 0.3 * H * W && numel(ind_2d) > 0.01 * H * W
-        subs = [xx(:) yy(:)];  % N-by-2, rows are (row,col)
+    if numel(ind_2d) < 0.5 * H * W && numel(ind_2d) > 0.01 * H * W
+        pix_idx = sub2ind([H, W], xx, yy);
+        [pix_unique, ~, grp] = unique(pix_idx);
+        first_frame_per_pixel = accumarray(grp, zz, [], @min);
+        dt_first = double(first_frame_per_pixel - min(zz));
+        pixel_weights = exp(-dt_first / evt_weight_tau);
+        [rr_unique, cc_unique] = ind2sub([H, W], pix_unique);
+        subs = [rr_unique cc_unique];  % N-by-2, rows are (row,col), one row per pixel in this event
         evt_domain_projection = evt_domain_projection + accumarray( ...
-            subs, 1, size(evt_domain_projection), @sum, 0);
+            subs, pixel_weights, size(evt_domain_projection), @sum, 0);
     end
 end
 evt_domain_projection_for_plot = evt_domain_projection;
@@ -138,7 +145,7 @@ colorbar
 % clear evt_all subs
 
 %% check the synchrony of signals from different locations in the FOV; The FOV is divided into 6 patches by geographical locations
-n_select = 5000; % choose number of pixels to average
+n_select = 2000; % choose number of pixels to average
 
 % reshape pixel index map
 pixel_map = reshape(1:(H*W), H, W);
@@ -214,13 +221,42 @@ set(gca,'YTick',1:6,'YTickLabel',labels)
 title('Correlation between patch signals')
 clim([-1 1])
 colormap(parula)
+%%
+mask_all = mask_upper_half + mask_lower_half;
+[H, W] = size(mask_all);
+
+% Step 1: compute temporal differences
+dX = diff(X_data, 1, 2);   % (pixels x (T-1))
+
+% Step 2: estimate variance per pixel
+noise_var = var(dX, 0, 2) / 2;   % (pixels x 1)
+
+% Step 3: reshape to image
+noise_map_full = reshape(noise_var, H, W);
+
+% Step 4: apply mask (set masked pixels to NaN)
+noise_map = noise_map_full;
+noise_map(mask_all == 0) = NaN;
+
+% Step 5: visualize
+figure;
+
+imagesc(noise_map);
+axis image;
+colorbar;
+title('Estimated Noise Variance Map');
+
+% Set NaNs (masked regions) to black
+colormap("hot");          % or any colormap you like
+set(gca, 'Color', 'k');    % background = black (for NaNs)
+
 %% The first principal component's time course has high correlation with the patches' spatial avg -> first PC's time course captures global activity
-[coeff, score, latent] = pca(X_data(unmasked_indices, :)');
-figure
-plot(score(:,1))
+% [coeff, score, latent] = pca(X_data(unmasked_indices, :)');
+% figure
+% plot(score(:,1))
 
 %% for NMF
-k_nmf_comp = 2; % number of components in NMF
+k_nmf_comp = 3; % number of components in NMF
 %% Constrained NMF
 opts = struct();
 opts.bg_quiet_prctile = 10;
@@ -228,12 +264,13 @@ opts.bg_quiet_prctile = 10;
 % Iteration / stopping
 % =====================
 opts.maxIter   = 15;
-opts.minIter   = 10;
-opts.tol       = 0.03;
+opts.minIter   = 5;
+opts.tol       = 0.01;
 % =====================
 % Spatial penalties
 % =====================
-opts.lambdaA_L1   = 60;     % sparcity constraint
+% opts.lambdaA_L1   = 80;     % sparcity constraint for uninjured
+opts.lambdaA_L1 = 30;
 opts.lambdaA_lap  = 2e3;     % smooth contiguous regions
 opts.lambdaA_excl = 5e2;        % OFF initially (overlap is allowed)
 opts.lambdaA_guide = 0;
@@ -268,7 +305,15 @@ opts.bg_init_mode = "lowrank"; % use uniform rank-1 global background
 opts.update_background = false; % freeze B after initialization
 opts.update_F = false; % freeze F after initialization
 opts.enforce_background_nonovershoot = true;
-opts.bg_floor_quantile = 0.01;
+opts.bg_floor_quantile = 0.02;
+opts.bg_refine_profile_from_F = true;
+opts.bg_profile_quantile = 0.15;
+opts.bg_profile_min_relF = 0.4;
+opts.bg_profile_min_frames = 150;
+opts.bg_profile_smooth_sigma = 8;
+opts.bg_profile_shrink_uniform = 0.05;
+opts.bg_profile_n_alternations = 4;
+opts.bg_noise_var = noise_var; % use the precomputed pixel-wise noise variance map
 % =====================
 % Nonnegativity handling
 % =====================
@@ -287,14 +332,30 @@ opts.maxBacktrack = 15;
 % =====================
 opts.seed        = 0;
 opts.verbose     = true;
-opts.printEvery = 10;
+opts.printEvery = 2;
 
+% =====================
+% Related to sparsity
+% =====================
+opts.adapt_lambdaA_L1 = true;
+opts.target_A_nnz_frac = 0.04;
+opts.target_A_nnz_tol = 0.01;
+opts.lambdaA_L1_adapt_rate = 8;
+opts.lambdaA_L1_min = 20;
+% opts.lambdaA_L1_min = 50; % for uninjured
+opts.lambdaA_L1_max = 130;
+opts.stop_if_A_all_zero = true;
+opts.require_target_A_nnz_for_stop = true;
+opts.rollback_on_A_nnz_undershoot = true;
 %% train on a small portion of videos, to figure out the A matrix
 subset_cutting_points = cumsum(video_lengths);
 subset_cutting_points = [0; subset_cutting_points];
 
-videos_train = [11 13 19 21 25 27 33 35 37];
-% videos_train = [26 28 34 36 38 40];
+% videos_train = [11 13 19 21 25 27 33 35 37]; % for uninjured, left stim
+% videos_train = [10 12 26 28 34 36 38 40]; % for uninjured, right stim
+% videos_train = [1 3 9 11 17 19 27 29]; % for injured, left stim
+videos_train = [2 4 10 12 18 20 28 30]; % for injured, right stim
+
 for ii = 1:length(videos_train)
     videos_train(ii) = data_map(videos_train(ii));
 end
@@ -316,10 +377,9 @@ for ii = 1:length(videos_test)
     time_test = [time_test start_idx:end_idx];
 end
 
-[A_upper, C_upper_train, info_upper_train] = custom_cnmf(X_data(:, time_train), H, W, k_nmf_comp, mask_upper_half, evt_domain_projection, opts);
+
 %%
-opts.AC_init_mode = "svd";
-opts.lambdaA_L1 = 50;
+[A_upper, C_upper_train, info_upper_train] = custom_cnmf(X_data(:, time_train), H, W, k_nmf_comp, mask_upper_half, evt_domain_projection, opts);
 [A_lower, C_lower_train, info_lower_train] = custom_cnmf(X_data(:, time_train), H, W, k_nmf_comp, mask_lower_half, evt_domain_projection, opts);
 
 %% show the training outcome
@@ -424,14 +484,6 @@ for j = 1:n_ethograms
     behavior_onsets{j} = onsets;
 end
 
-% ==============================
-% Shared Y-axis scaling (traces)
-% ==============================
-global_ymin = min(C(:));
-global_ymax = max(C(:));
-y_margin = 0.05 * (global_ymax - global_ymin);
-ylim_all = [global_ymin - y_margin, global_ymax + y_margin];
-
 % ==================================
 % Shared color scaling (spatial maps)
 % ==================================
@@ -477,17 +529,27 @@ for i = 1:k
         c_test(time_test) = C(i, time_test);
         plot(t, c_test, 'b', 'LineWidth', 1.2);
     end
-    ylim([ylim_all(1), ylim_all(2) + 0.06*(ylim_all(2)-ylim_all(1))]);
+
+    comp_vals = C(i, :);
+    comp_ymin = min(comp_vals);
+    comp_ymax = max(comp_vals);
+    comp_range = comp_ymax - comp_ymin;
+    if comp_range <= 0
+        comp_range = max(1e-6, abs(comp_ymax));
+    end
+    comp_margin = 0.05 * comp_range;
+    ylim_i = [comp_ymin - comp_margin, comp_ymax + 0.06 * comp_range + comp_margin];
+    ylim(ylim_i);
 
     xlim([t(1), t(end)]);
     
     % Short tick length (small to avoid spike overlap)
     % Short tick length
-    tick_length = 0.04 * (ylim_all(2) - ylim_all(1));
-    y_top = ylim_all(2);
+    tick_length = 0.04 * comp_range;
+    y_top = comp_ymax + comp_margin;
     
     % Small vertical offset for label (above tick)
-    label_offset = 0.01 * (ylim_all(2) - ylim_all(1));
+    label_offset = 0.01 * comp_range;
     
     for j = 1:n_ethograms
         onset_frames = behavior_onsets{j};

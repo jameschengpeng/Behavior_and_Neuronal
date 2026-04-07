@@ -55,6 +55,21 @@ idx = find(mask);
 Pm  = numel(idx);
 Xraw = X_data(idx, :);
 
+bg_noise_var_act = [];
+if isfield(opts, 'bg_noise_var') && ~isempty(opts.bg_noise_var)
+    bg_noise_var_full = reshape(opts.bg_noise_var, [], 1);
+    if numel(bg_noise_var_full) == P
+        bg_noise_var_act = bg_noise_var_full(idx);
+    elseif numel(bg_noise_var_full) == Pm
+        bg_noise_var_act = bg_noise_var_full;
+    else
+        error('opts.bg_noise_var must have length P or number of active pixels Pm.');
+    end
+end
+
+opts_bg = opts;
+opts_bg.bg_noise_var = bg_noise_var_act;
+
 % Nonnegativity handling for X
 X = Xraw;
 if opts.nonneg_mode == "shift"
@@ -77,7 +92,7 @@ if use_background
     assert(all(Bact(:) >= 0), 'B_full must be nonnegative.');
     r = size(Bact, 2);
 else
-    Bact = zeros(Pm, 0);
+    Bact = zeros(Pm, 0, 'like', X);
     r = 0;
 end
 
@@ -113,7 +128,7 @@ if use_background
     use_nonovershoot_init = opts.enforce_background_nonovershoot && (r == 1);
 
     if use_nonovershoot_init
-        F = fit_rank1_nonovershoot(Bact, X, opts);
+        F = fit_rank1_nonovershoot(Bact, X, opts_bg);
 
         AAt = Aact' * Aact + opts.bg_eps * eye(K, 'like', Aact);
         AtR = Aact' * (X - Bact*F);
@@ -140,7 +155,7 @@ else
     AtX = Aact' * X;
     C = AAt \ AtX;  % K x T
     C = max(C, 0);
-    F = zeros(0, T);
+    F = zeros(0, T, 'like', X);
 end
 
 % For fixed-A inference, a dead component can be valid (absent in this split).
@@ -205,26 +220,36 @@ for it = 1:opts.maxIter
     % (2) Update F (background temporal, projected gradient + smoothness)
     % =========================
     if use_background && opts.update_F
-        for s = 1:opts.innerF
-            % grad wrt F: B'*(A*C + B*F - X) + lambdaF*(F*DtD)
-            R = (Aact*C + Bact*F) - X;
-            gradF = (Bact' * R) + opts.lambdaF_smooth * apply_DtD_right(F, DtD);
+        AX = Aact * C;
+        R0pos = max(X - AX, 0);
+        use_nonovershoot_F = opts.enforce_background_nonovershoot && (r == 1);
 
-            Fnew = max(0, F - etaF * gradF);
+        if use_nonovershoot_F
+            R0 = X - AX;
+            F = fit_rank1_nonovershoot(Bact, R0, opts_bg);
+        else
+            BtB = (Bact' * Bact) + opts.bg_eps * eye(r, 'like', Bact);
+            BR = Bact' * R0pos;
 
-            if opts.backtracking
-                [objOld] = objective_val(X, Aact, C, Bact, F, DtD, opts);
-                [objNew] = objective_val(X, Aact, C, Bact, Fnew, DtD, opts);
-                bt = 0;
-                while objNew > objOld && bt < opts.maxBacktrack
-                    etaF = etaF * 0.5;
-                    Fnew = max(0, F - etaF * gradF);
-                    objNew = objective_val(X, Aact, C, Bact, Fnew, DtD, opts);
-                    bt = bt + 1;
+            for s = 1:opts.innerF
+                gradF = (BtB * F - BR) + opts.lambdaF_smooth * apply_DtD_right(F, DtD);
+
+                Fnew = max(0, F - etaF * gradF);
+
+                if opts.backtracking
+                    [objOld] = objective_val(X, Aact, C, Bact, F, DtD, opts);
+                    [objNew] = objective_val(X, Aact, C, Bact, Fnew, DtD, opts);
+                    bt = 0;
+                    while objNew > objOld && bt < opts.maxBacktrack
+                        etaF = etaF * 0.5;
+                        Fnew = max(0, F - etaF * gradF);
+                        objNew = objective_val(X, Aact, C, Bact, Fnew, DtD, opts);
+                        bt = bt + 1;
+                    end
                 end
-            end
 
-            F = Fnew;
+                F = Fnew;
+            end
         end
 
         % Optional quantile-baseline anchoring (row-wise)
@@ -280,7 +305,7 @@ function opts = set_default_opts(opts)
     def.bg_floor_noise_sigma = [];
 
     % Optional baseline anchoring for F)
-    def.enforce_F_quantile_baseline = true; % whether to shift F after each update to keep a chosen quantile anchored
+    def.enforce_F_quantile_baseline = false; % whether to shift F after each update to keep a chosen quantile anchored
     def.F_baseline_prctile = 5;      % e.g., 5 or 10
     def.F_quantile_ref = [];          % r x 1 reference from training F
     def.F_baseline_anchor_strength = 1; % 0..1 (1 = full correction each iter)
@@ -292,7 +317,7 @@ function opts = set_default_opts(opts)
 
     def.innerC = 1;
     def.innerF = 1;  % similar to innerC
-    def.update_F = true;
+    def.update_F = false;
 
     def.seed = 0;
     def.bg_eps = 1e-12;

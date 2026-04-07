@@ -29,11 +29,27 @@ assert(numel(mask) == P, 'mask must be HxW or P-vector.');
 % Active pixels only (tissue)
 idx = find(mask);
 Pm  = numel(idx);
-X = double(X_data(idx, :));
+X = X_data(idx, :);
+
+bg_noise_var_act = [];
+if isfield(opts, 'bg_noise_var') && ~isempty(opts.bg_noise_var)
+    bg_noise_var_full = reshape(opts.bg_noise_var, [], 1);
+    if numel(bg_noise_var_full) == P
+        bg_noise_var_act = bg_noise_var_full(idx);
+    elseif numel(bg_noise_var_full) == Pm
+        bg_noise_var_act = bg_noise_var_full;
+    else
+        error('opts.bg_noise_var must have length P or number of active pixels Pm.');
+    end
+end
+
+opts_bg = opts;
+opts_bg.bg_noise_var = bg_noise_var_act;
 
 % use the AQuA2 detected events' projection as a guide to CNMF
-evt_domain_projection = reshape(evt_domain_projection, [], 1);
-guide_act  = double(evt_domain_projection(idx));
+evt_domain_projection_2d = reshape(evt_domain_projection, H, W);
+evt_domain_projection_vec = reshape(evt_domain_projection_2d, [], 1);
+guide_act  = cast(double(evt_domain_projection_vec(idx)), 'like', X);
 guide_act  = guide_act / (max(guide_act) + eps);  % normalize to [0,1]
 
 % Nonnegativity handling for X (IMPORTANT: avoid double-shifting)
@@ -61,6 +77,13 @@ end
 
 % Temporal smoothness operator D'D (T x T)
 DtD = build_DtD(T);
+if isa(X, 'single')
+    try
+        DtD = single(DtD);
+    catch
+        % fallback: keep sparse double if single sparse is unsupported
+    end
+end
 
 % ---------------------------
 % Initialization
@@ -71,21 +94,22 @@ rng(opts.seed);
 r = opts.bg_rank;
 
 if opts.use_background
-    if opts.bg_init_mode == "pc1_global"
-        [B, F] = init_background_pc1_global(X, r, opts);
-    else
-        bgopts = struct();
-        bgopts.bg_rank = r;
-        bgopts.use_quiet_init = true;
-        bgopts.quiet_prctile = opts.bg_quiet_prctile;
-        bgopts.n_refine = 1;
-        bgopts.nonneg_mode = "clip";
-        bgopts.eps0 = opts.bg_eps;
-        [B, F] = init_background_lowrank(X, bgopts);   % B: Pm x r, F: r x T
+    bgopts = struct();
+    bgopts.bg_rank = r;
+    bgopts.use_quiet_init = true;
+    bgopts.quiet_prctile = opts.bg_quiet_prctile;
+    bgopts.n_refine = 1;
+    bgopts.nonneg_mode = "clip";
+    bgopts.eps0 = opts.bg_eps;
+    bgopts.bg_noise_var = bg_noise_var_act;
+    [B, F] = init_background_lowrank(X, bgopts);   % B: Pm x r, F: r x T
+
+    if r == 1 && opts.bg_refine_profile_from_F
+        [B, F] = refine_rank1_background_profile(X, B, F, H, W, mask, opts_bg);
     end
 else
-    B = zeros(Pm, 0);
-    F = zeros(0, T);
+    B = zeros(Pm, 0, 'like', X);
+    F = zeros(0, T, 'like', X);
 end
 
 % Optional baseline anchoring for F during training.
@@ -106,11 +130,11 @@ end
 % Residual for component init
 Xr = X - B*F;
 Xr = max(Xr, 0);  % keep nonnegativity
-[Aact, C, init_info] = init_AC_from_event_projection(Xr, evt_domain_projection, reshape(mask, H, W), K, opts);
+[Aact, C, init_info] = init_AC_from_event_projection(Xr, evt_domain_projection_2d, reshape(mask, H, W), K, opts);
 clear Xr
 
 % this block is for checking the initialization of spatial footprints
-A_init = zeros(size(mask, 1), K);
+A_init = zeros(size(mask, 1), K, 'like', Aact);
 A_init(idx, :) = Aact;
 A_init_comb = reshape(sum(A_init, 2), [H, W]);
 clear mask
@@ -118,8 +142,13 @@ clear mask
 % Reinit any dead components
 for k = 1:K
     if all(Aact(:,k) == 0) || all(C(k,:) == 0)
-        Aact(:,k) = max(0, rand(Pm,1));
-        C(k,:)    = max(0, rand(1,T));
+        if opts.AC_init_mode == "event_projection"
+            Aact(:,k) = 0;
+            C(k,:) = 0;
+        else
+            Aact(:,k) = max(0, rand(Pm,1));
+            C(k,:)    = max(0, rand(1,T));
+        end
     end
 end
 
@@ -131,6 +160,9 @@ end
 info.obj    = zeros(opts.maxIter,1);
 info.relchg = zeros(opts.maxIter,1);
 info.relRecon = zeros(opts.maxIter,1);
+info.lambdaA_L1 = zeros(opts.maxIter,1);
+info.A_nnz_frac = zeros(opts.maxIter,1);
+info.stop_reason = "maxIter";
 info.init = init_info;
 clear init_info
 
@@ -140,6 +172,16 @@ clear init_info
 prevObj = inf;
 
 for it = 1:opts.maxIter
+    info.lambdaA_L1(it) = opts.lambdaA_L1;
+
+    if opts.adapt_lambdaA_L1 && opts.rollback_on_A_nnz_undershoot && it > 1
+        % Keep the full previous factor state so an overshoot below the
+        % lower sparsity bound can revert to the last acceptable iterate.
+        A_prev_iter = Aact;
+        C_prev_iter = C;
+        B_prev_iter = B;
+        F_prev_iter = F;
+    end
 
     % ---- Compute residual with current background
     R = (Aact*C + B*F) - X;
@@ -223,12 +265,12 @@ for it = 1:opts.maxIter
 
         if opts.update_F
             % ---- Update F on ALL frames using full residual (with B fixed)
-            BtB = (B' * B) + opts.bg_eps * eye(r);
+            BtB = (B' * B) + opts.bg_eps * eye(r, 'like', B);
             BR  = (B' * R0pos);
             use_nonovershoot_F = opts.enforce_background_nonovershoot && r == 1;
             if use_nonovershoot_F
                 R0 = X - AX;
-                F_cap = fit_rank1_nonovershoot(B, R0, opts);
+                F_cap = fit_rank1_nonovershoot(B, R0, opts_bg);
                 clear R0
             end
 
@@ -356,6 +398,7 @@ for it = 1:opts.maxIter
 
     relRecon = norm(X - (Aact*C + B*F), 'fro')^2 / (norm(X,'fro')^2 + eps);
     info.relRecon(it) = relRecon;
+    info.A_nnz_frac(it) = nnz(Aact) / max(1, numel(Aact));
 
     if it > 1
         info.relchg(it) = abs(obj - prevObj) / (abs(prevObj) + eps);
@@ -375,19 +418,19 @@ for it = 1:opts.maxIter
         gradA_fit = (Rtmp * C');
     
         % Laplacian gradient
-        gradA_lap = zeros(size(Aact));
+        gradA_lap = zeros(size(Aact), 'like', Aact);
         if opts.lambdaA_lap > 0
             gradA_lap = opts.lambdaA_lap * (L * Aact);
         end
     
         % Exclusivity gradient
-        gradA_excl = zeros(size(Aact));
+        gradA_excl = zeros(size(Aact), 'like', Aact);
         if opts.lambdaA_excl > 0
             sumA = sum(Aact, 2);
             gradA_excl = opts.lambdaA_excl * (sumA - Aact);
         end
 
-        gradA_compact = zeros(size(Aact));
+        gradA_compact = zeros(size(Aact), 'like', Aact);
         if opts.lambdaA_compact > 0
             [dist2_compact, compact_obj] = compactness_dist2_and_term(Aact, row_act, col_act, opts.compact_eps);
             gradA_compact = opts.lambdaA_compact * dist2_compact;
@@ -419,7 +462,7 @@ for it = 1:opts.maxIter
         % =========================
         gradC_fit = Aact' * Rtmp;
     
-        gradC_smooth = zeros(size(C));
+        gradC_smooth = zeros(size(C), 'like', C);
         if opts.lambdaC_smooth > 0
             gradC_smooth = opts.lambdaC_smooth * (C * DtD);
         end
@@ -427,8 +470,8 @@ for it = 1:opts.maxIter
         % =========================
         % ---- F diagnostics ----
         % =========================
-        gradF_fit = zeros(size(F));
-        gradF_smooth = zeros(size(F));
+        gradF_fit = zeros(size(F), 'like', F);
+        gradF_smooth = zeros(size(F), 'like', F);
         if ~isempty(F)
             gradF_fit = B' * Rtmp;
             if opts.lambdaF_smooth > 0
@@ -437,7 +480,7 @@ for it = 1:opts.maxIter
         end
     
         % AQuA2 guide diagnostics
-        grad_guide = zeros(size(Aact));
+        grad_guide = zeros(size(Aact), 'like', Aact);
         guide_obj = 0;
         
         if opts.lambdaA_guide > 0
@@ -474,21 +517,93 @@ for it = 1:opts.maxIter
         disp('-----------')
     end
 
-    % stopping
-    if it >= opts.minIter && it > 1 && info.relchg(it) < opts.tol
+    % If A has fully collapsed, stop immediately rather than continuing
+    % with a zero support that will not be useful for factorization.
+    if opts.stop_if_A_all_zero && nnz(Aact) == 0
         info.obj = info.obj(1:it);
         info.relchg = info.relchg(1:it);
         info.relRecon = info.relRecon(1:it);
+        info.lambdaA_L1 = info.lambdaA_L1(1:it);
+        info.A_nnz_frac = info.A_nnz_frac(1:it);
+        info.stop_reason = "A_all_zero";
+        if opts.verbose
+            fprintf('Stopping early at iter %d because Aact became all zero.\n', it);
+        end
+        break;
+    end
+
+    if opts.adapt_lambdaA_L1 && opts.rollback_on_A_nnz_undershoot && it > 1
+        target_lo = max(0, opts.target_A_nnz_frac - opts.target_A_nnz_tol);
+        if info.A_nnz_frac(it) < target_lo
+            nnz_frac_undershoot = info.A_nnz_frac(it);
+            nnz_frac_reverted = info.A_nnz_frac(it - 1);
+
+            Aact = A_prev_iter;
+            C = C_prev_iter;
+            B = B_prev_iter;
+            F = F_prev_iter;
+            prevObj = info.obj(it - 1);
+
+            info.obj = info.obj(1:it-1);
+            info.relchg = info.relchg(1:it-1);
+            info.relRecon = info.relRecon(1:it-1);
+            info.lambdaA_L1 = info.lambdaA_L1(1:it-1);
+            info.A_nnz_frac = info.A_nnz_frac(1:it-1);
+            info.stop_reason = "A_nnz_undershoot_rollback";
+
+            if opts.verbose
+                fprintf(['Stopping early at iter %d because A support undershot the lower target bound ' ...
+                         '(%.4f < %.4f); reverting to iter %d with support fraction %.4f.\n'], ...
+                        it, nnz_frac_undershoot, target_lo, it - 1, nnz_frac_reverted);
+            end
+            break;
+        end
+    end
+
+    % Adapt lambdaA_L1 toward the desired support fraction for the next iteration.
+    if opts.adapt_lambdaA_L1
+        nnz_frac_cur = info.A_nnz_frac(it);
+        target_hi = min(1, opts.target_A_nnz_frac + opts.target_A_nnz_tol);
+        target_lo = max(0, opts.target_A_nnz_frac - opts.target_A_nnz_tol);
+
+        if nnz_frac_cur > target_hi
+            % If the footprint is too large, shrink the size by multiplying
+            % an exponential function
+            step = exp(opts.lambdaA_L1_adapt_rate * (nnz_frac_cur - opts.target_A_nnz_frac));
+            opts.lambdaA_L1 = min(opts.lambdaA_L1_max, opts.lambdaA_L1 * step);
+        elseif nnz_frac_cur < target_lo
+            % If the footprint is too small, enlarge the size by dividing
+            % an exponential function
+            step = exp(opts.lambdaA_L1_adapt_rate * (opts.target_A_nnz_frac - nnz_frac_cur));
+            opts.lambdaA_L1 = max(opts.lambdaA_L1_min, opts.lambdaA_L1 / step);
+        end
+    end
+
+    % stopping
+    stop_on_relchg = (it >= opts.minIter && it > 1 && info.relchg(it) < opts.tol);
+    if opts.adapt_lambdaA_L1 && opts.require_target_A_nnz_for_stop
+        target_hi = min(1, opts.target_A_nnz_frac + opts.target_A_nnz_tol);
+        target_lo = max(0, opts.target_A_nnz_frac - opts.target_A_nnz_tol);
+        stop_on_relchg = stop_on_relchg && info.A_nnz_frac(it) >= target_lo && info.A_nnz_frac(it) <= target_hi;
+    end
+
+    if stop_on_relchg
+        info.obj = info.obj(1:it);
+        info.relchg = info.relchg(1:it);
+        info.relRecon = info.relRecon(1:it);
+        info.lambdaA_L1 = info.lambdaA_L1(1:it);
+        info.A_nnz_frac = info.A_nnz_frac(1:it);
+        info.stop_reason = "relchg_tol";
         break;
     end
 end
 
 % Put back into full P x K with masked pixels = 0
-A = zeros(P, K);
+A = zeros(P, K, 'like', Aact);
 A(idx, :) = Aact;
 
 % Save background in info (doesn't change function signature)
-info.B = zeros(P,size(B,2));
+info.B = zeros(P, size(B,2), 'like', B);
 info.B(idx, :) = B;
 info.F = F;
 
@@ -527,7 +642,7 @@ opts = set_defaults_for_background(opts);
 r = opts.bg_rank;
 
 % Nonnegativity handling for background init
-Xpos = double(X);
+Xpos = X;
 switch string(opts.nonneg_mode)
     case "clip"
         Xpos = max(Xpos, 0);
@@ -558,7 +673,7 @@ Xq = Xpos(:, quiet_idx);
 % For rank-1 background, use a uniform spatial profile to represent a
 % biologically shared field-wide response rather than a data-adaptive mode.
 if r == 1
-    B = ones(Pm, 1);
+    B = ones(Pm, 1, 'like', Xpos);
     B = B / (norm(B) + opts.eps0);
     F = fit_rank1_nonovershoot(B, Xpos, opts); % 1 x T
 else
@@ -572,7 +687,7 @@ else
     end
 
     B = max(0, U * sqrt(S));      % Pm x r
-    BtB = (B' * B) + opts.eps0 * eye(r);
+    BtB = (B' * B) + opts.eps0 * eye(r, 'like', B);
     F = max(0, (BtB \ (B' * Xpos))); % r x T
 end
 
@@ -584,10 +699,10 @@ for k = 1:opts.n_refine
         F = fit_rank1_nonovershoot(B, Xpos, opts);  % 1 x T
     else
         Fq = F(:, quiet_idx);
-        FFt = (Fq * Fq') + opts.eps0 * eye(r);
+        FFt = (Fq * Fq') + opts.eps0 * eye(r, 'like', Fq);
         B = max(0, (Xq * Fq') / FFt);      % Pm x r, quiet-frame only
 
-        BtB = (B' * B) + opts.eps0 * eye(r);
+        BtB = (B' * B) + opts.eps0 * eye(r, 'like', B);
         F = max(0, (BtB \ (B' * Xpos)));  % r x T
     end
 end
@@ -597,62 +712,80 @@ colnorm = sqrt(sum(B.^2, 1)) + opts.eps0;
 B = B ./ colnorm;
 F = F .* colnorm';
 
-% Diagnostics
-den = norm(Xpos, 'fro') + opts.eps0;
-info = struct();
-info.quiet_idx = quiet_idx;
-info.Xpos = Xpos;
-info.recon_err = norm(Xpos - B*F, 'fro') / den;
+% Diagnostics (only when caller requests the third output)
+if nargout >= 3
+    den = norm(Xpos, 'fro') + opts.eps0;
+    info = struct();
+    info.quiet_idx = quiet_idx;
+    info.Xpos = Xpos;
+    info.recon_err = norm(Xpos - B*F, 'fro') / den;
+else
+    info = struct();
+end
 end
 
-function [B, F] = init_background_pc1_global(X, r, opts)
-% Initialize a global background mode from the first principal component.
-% B is inferred from the centered PC1 spatial loading and constrained
-% nonnegative. F is then fit conservatively so B*F does not exceed X.
+function [B, F] = refine_rank1_background_profile(X, B, F, H, W, mask, opts)
+% Refine a rank-1 background profile cheaply from lower quantiles of X./F.
+% This approximates a per-pixel lower-quantile regression while keeping B
+% smooth and close to a broad field-wide profile.
 
-if r ~= 1
-    error('bg_init_mode="pc1_global" currently requires bg_rank = 1.');
+if isfield(opts, 'bg_eps')
+    eps_bg = opts.bg_eps;
+elseif isfield(opts, 'eps0')
+    eps_bg = opts.eps0;
+else
+    eps_bg = 1e-12;
 end
 
-X_for_bg = temporal_gaussian_smooth(X, opts.bg_pc1_temporal_sigma_frames);
-
-Xc = X_for_bg;
-if opts.bg_pc1_center
-    Xc = Xc - mean(Xc, 2);
+if size(B, 2) ~= 1 || isempty(F)
+    return;
 end
 
-try
-    [u, s, ~] = svds(Xc, 1);
-catch
-    [u, s, ~] = svd(Xc, 'econ');
-    u = u(:,1);
-    s = s(1,1);
+mask = reshape(mask, [], 1) ~= 0;
+idx = find(mask);
+B = max(B, 0);
+
+for it = 1:opts.bg_profile_n_alternations
+    f = double(F(1, :));
+    fmax = max(f);
+    if ~(isfinite(fmax) && fmax > eps_bg)
+        break;
+    end
+
+    informative = (f >= opts.bg_profile_min_relF * fmax);
+    if nnz(informative) < opts.bg_profile_min_frames
+        [~, order] = sort(f, 'descend');
+        keep_n = min(numel(order), max(opts.bg_profile_min_frames, ceil(0.1 * numel(order))));
+        informative = false(size(f));
+        informative(order(1:keep_n)) = true;
+    end
+
+    f_use = max(f(informative), eps_bg);
+    ratio = double(X(:, informative)) ./ reshape(f_use, 1, []);
+    b_raw = prctile(ratio, 100 * opts.bg_profile_quantile, 2);
+    b_raw = max(b_raw, 0);
+
+    if opts.bg_profile_smooth_sigma > 0
+        b_full = zeros(H * W, 1);
+        b_full(idx) = b_raw;
+        b_img = reshape(b_full, H, W);
+
+        mask_img = reshape(double(mask), H, W);
+        num = imgaussfilt(b_img .* mask_img, opts.bg_profile_smooth_sigma);
+        den = imgaussfilt(mask_img, opts.bg_profile_smooth_sigma);
+        b_img = num ./ max(den, eps_bg);
+        b_raw = b_img(mask);
+    end
+
+    if opts.bg_profile_shrink_uniform > 0
+        b_mean = mean(b_raw);
+        b_raw = (1 - opts.bg_profile_shrink_uniform) * b_raw + opts.bg_profile_shrink_uniform * b_mean;
+    end
+
+    B = cast(max(b_raw, 0), 'like', X);
+    B = B / (norm(B) + eps_bg);
+    F = fit_rank1_nonovershoot(B, X, opts);
 end
-
-if sum(u) < 0
-    u = -u;
-end
-
-b0 = u * sqrt(s);
-switch opts.bg_pc1_nonneg_mode
-    case "clip"
-        B = max(b0, 0);
-    case "shift"
-        B = b0 - min(b0);
-    otherwise
-        error('opts.bg_pc1_nonneg_mode must be "clip" or "shift".');
-end
-
-if all(B == 0)
-    B = abs(b0);
-end
-
-colnorm = sqrt(sum(B.^2, 1)) + opts.bg_eps;
-B = B ./ colnorm;
-
-% Fit a conservative temporal strength from the lower tail rather than a
-% projection fit, reducing immediate capture of localized signal.
-F = fit_rank1_nonovershoot(B, X, opts);
 end
 
 %% -----------------------
@@ -667,6 +800,13 @@ def.nonneg_mode = "none"; % safest for dF/F init
 def.eps0 = 1e-12;
 def.bg_floor_quantile = 0.05;
 def.bg_floor_noise_sigma = [];
+def.bg_refine_profile_from_F = false;
+def.bg_profile_quantile = 0.1;
+def.bg_profile_min_relF = 0.2;
+def.bg_profile_min_frames = 50;
+def.bg_profile_smooth_sigma = 20;
+def.bg_profile_shrink_uniform = 0.5;
+def.bg_profile_n_alternations = 1;
 
 f = fieldnames(def);
 for i = 1:numel(f)
@@ -700,6 +840,18 @@ function opts = set_default_opts(opts)
     def.tol = 1e-5;
 
     def.lambdaA_L1 = 1e-6;
+    def.adapt_lambdaA_L1 = false;
+    def.target_A_nnz_frac = 0.10;
+    def.target_A_nnz_tol = 0.02;
+    def.lambdaA_L1_adapt_rate = 8;
+    def.lambdaA_L1_min = 1e-10;
+    def.lambdaA_L1_max = 1e6;
+    def.stop_if_A_all_zero = true;
+    def.require_target_A_nnz_for_stop = true;
+    % Default ON: once A undershoots below the lower support target, later
+    % regrowth often returns as scattered pixels rather than the original
+    % compact event-guided support.
+    def.rollback_on_A_nnz_undershoot = true;
     def.lambdaA_lap = 1e-4;
     def.lambdaA_excl = 0;          % start OFF
     def.lambdaA_compact = 0;       % OFF by default (discourage scattered A)
@@ -710,6 +862,7 @@ function opts = set_default_opts(opts)
     def.enforce_background_nonovershoot = false;
     def.bg_floor_quantile = 0.05;
     def.bg_floor_noise_sigma = [];
+    def.bg_noise_var = [];
     def.enforce_F_quantile_baseline = false;
     def.F_baseline_prctile = 5;
     def.F_quantile_ref = [];
@@ -725,8 +878,8 @@ function opts = set_default_opts(opts)
     def.guide_eps = 1e-12;
     def.init_evt_sigma = 8;
     def.init_evt_min_peak_dist = 200;
-    def.init_evt_min_frac = 0.10;
-    def.init_evt_max_frac = 0.30;
+    def.init_evt_min_frac = 0.05;
+    def.init_evt_max_frac = 0.10;
     def.init_evt_threshold_levels = 40;
     def.init_evt_ridge = 1e-6;
     def.AC_init_mode = "event_projection";
@@ -750,11 +903,15 @@ function opts = set_default_opts(opts)
     def.use_background = true;
     def.bg_rank = 3;
     def.bg_eps = 1e-12;          % small ridge for SPD solves
-    def.bg_init_mode = "lowrank"; % "lowrank" or "pc1_global"
+    def.bg_init_mode = "lowrank";
     def.update_background = true;
-    def.bg_pc1_center = true;
-    def.bg_pc1_nonneg_mode = "clip";
-    def.bg_pc1_temporal_sigma_frames = 10;
+    def.bg_refine_profile_from_F = false;
+    def.bg_profile_quantile = 0.1;
+    def.bg_profile_min_relF = 0.2;
+    def.bg_profile_min_frames = 50;
+    def.bg_profile_smooth_sigma = 20;
+    def.bg_profile_shrink_uniform = 0.5;
+    def.bg_profile_n_alternations = 1;
 
     % NEW: backtracking safeguard
     def.backtracking = true;
@@ -775,11 +932,29 @@ function opts = set_default_opts(opts)
 
     % Guardrail for quiet frame percentile used by background updates
     opts.normalize_prctile = min(100, max(50, opts.normalize_prctile));
+    opts.target_A_nnz_frac = min(1, max(0, opts.target_A_nnz_frac));
+    opts.target_A_nnz_tol = min(1, max(0, opts.target_A_nnz_tol));
+    opts.lambdaA_L1_adapt_rate = max(0, opts.lambdaA_L1_adapt_rate);
+    opts.lambdaA_L1_min = max(0, opts.lambdaA_L1_min);
+    opts.lambdaA_L1_max = max(opts.lambdaA_L1_min, opts.lambdaA_L1_max);
+    opts.adapt_lambdaA_L1 = logical(opts.adapt_lambdaA_L1);
+    opts.stop_if_A_all_zero = logical(opts.stop_if_A_all_zero);
+    opts.require_target_A_nnz_for_stop = logical(opts.require_target_A_nnz_for_stop);
+    opts.rollback_on_A_nnz_undershoot = logical(opts.rollback_on_A_nnz_undershoot);
     opts.AC_init_mode = string(opts.AC_init_mode);
     if opts.bg_floor_quantile > 1
         opts.bg_floor_quantile = opts.bg_floor_quantile / 100;
     end
     opts.bg_floor_quantile = min(0.49, max(0.001, opts.bg_floor_quantile));
+    if opts.bg_profile_quantile > 1
+        opts.bg_profile_quantile = opts.bg_profile_quantile / 100;
+    end
+    opts.bg_profile_quantile = min(0.49, max(0.001, opts.bg_profile_quantile));
+    opts.bg_profile_min_relF = min(1, max(0, opts.bg_profile_min_relF));
+    opts.bg_profile_min_frames = max(5, round(opts.bg_profile_min_frames));
+    opts.bg_profile_smooth_sigma = max(0, opts.bg_profile_smooth_sigma);
+    opts.bg_profile_shrink_uniform = min(1, max(0, opts.bg_profile_shrink_uniform));
+    opts.bg_profile_n_alternations = max(0, round(opts.bg_profile_n_alternations));
     if opts.F_baseline_prctile <= 1
         opts.F_baseline_prctile = 100 * opts.F_baseline_prctile;
     end
@@ -863,50 +1038,52 @@ function DtD = build_DtD(T)
 end
 %%
 function L = build_laplacian_active(H, W, maskVec, neighborhood)
-    maskImg = reshape(maskVec, H, W);
+    maskVec = reshape(maskVec, [], 1) ~= 0;
     idxFull = find(maskVec);
     Pm = numel(idxFull);
 
-    map = zeros(H*W,1);
-    map(idxFull) = 1:Pm;
+    % Map from full-image linear index to active-pixel index
+    map = zeros(H*W, 1, 'int32');
+    map(idxFull) = int32(1:Pm);
 
-    Wmat = spalloc(Pm, Pm, Pm*4);
-    lin = @(i,j) sub2ind([H W], i, j);
+    % Row/col of every active pixel
+    [ri, ci] = ind2sub([H, W], idxFull);
 
-    for i = 1:H
-        for j = 1:W
-            if ~maskImg(i,j), continue; end
-            p_full = lin(i,j);
-            p = map(p_full);
-
-            neigh = [];
-            if i > 1, neigh(end+1,:) = [i-1 j]; end %#ok<AGROW>
-            if i < H, neigh(end+1,:) = [i+1 j]; end %#ok<AGROW>
-            if j > 1, neigh(end+1,:) = [i j-1]; end %#ok<AGROW>
-            if j < W, neigh(end+1,:) = [i j+1]; end %#ok<AGROW>
-
-            if neighborhood == 8
-                if i>1 && j>1, neigh(end+1,:)=[i-1 j-1]; end %#ok<AGROW>
-                if i>1 && j<W, neigh(end+1,:)=[i-1 j+1]; end %#ok<AGROW>
-                if i<H && j>1, neigh(end+1,:)=[i+1 j-1]; end %#ok<AGROW>
-                if i<H && j<W, neigh(end+1,:)=[i+1 j+1]; end %#ok<AGROW>
-            end
-
-            for t = 1:size(neigh,1)
-                ii = neigh(t,1); jj = neigh(t,2);
-                if ~maskImg(ii,jj), continue; end
-                q_full = lin(ii,jj);
-                q = map(q_full);
-
-                Wmat(p,q) = 1;
-                Wmat(q,p) = 1;
-            end
-        end
+    % Neighbor offsets
+    if neighborhood == 8
+        offsets = int32([-1 0; 1 0; 0 -1; 0 1; -1 -1; -1 1; 1 -1; 1 1]);
+    else
+        offsets = int32([-1 0; 1 0; 0 -1; 0 1]);
     end
 
-    deg = sum(Wmat, 2);
-    D = spdiags(deg, 0, Pm, Pm);
-    L = D - Wmat;
+    nDir = size(offsets, 1);
+    src = cell(nDir, 1);
+    dst = cell(nDir, 1);
+    active_idx = (1:Pm)';
+
+    for d = 1:nDir
+        rn = ri + double(offsets(d, 1));
+        cn = ci + double(offsets(d, 2));
+
+        valid = (rn >= 1) & (rn <= H) & (cn >= 1) & (cn <= W);
+
+        nb_full = zeros(Pm, 1);
+        nb_full(valid) = sub2ind([H, W], rn(valid), cn(valid));
+
+        nb_active = zeros(Pm, 1);
+        nb_active(valid) = double(map(nb_full(valid)));
+
+        keep = valid & (nb_active > 0);
+        src{d} = active_idx(keep);
+        dst{d} = nb_active(keep);
+    end
+
+    src_all = vertcat(src{:});
+    dst_all = vertcat(dst{:});
+    Wmat = sparse(src_all, dst_all, 1, Pm, Pm);
+
+    deg = full(sum(Wmat, 2));
+    L = spdiags(deg, 0, Pm, Pm) - Wmat;
 end
 %%
 function X = soft_thresh_nonneg(X, tau)
