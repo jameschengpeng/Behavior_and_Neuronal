@@ -4,9 +4,9 @@ addpath(genpath('C:\Users\james\CBIL\Astrocyte\scalable_calcium_model_prev'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 
 %%
-% preprocessed_storage_path = "F:\Mouse_behavior_data\D21\preprocessed_data";
-preprocessed_storage_path = "F:\CCK_PilotData_Baseline\preprocessed_data";
-stim_side = "L";
+preprocessed_storage_path = "F:\Mouse_behavior_data\D21\preprocessed_data";
+% preprocessed_storage_path = "F:\CCK_PilotData_Baseline\preprocessed_data";
+stim_side = "R";
 NMF_result = load(fullfile(preprocessed_storage_path, stim_side, "NMF_result.mat"));
 A = NMF_result.A; % n_pixels * (2 * n_components); first half for ipsilateral, second half for contralateral
 B = NMF_result.B; % n_pixels * 2; first for ipsilateral background, second for contralateral background
@@ -49,9 +49,11 @@ set(gcf,'Color','w')
 set(findall(gcf,'-property','FontName'),'FontName','Arial')
 set(findall(gcf,'-property','FontSize'),'FontSize',10)
 
-%%
+%% Show the footprints
 selected_comps = [1 2 3 4 5 6];
 plot_nmf_components_with_ethogram(A(:, selected_comps), C(selected_comps, :), etho_mat_all, 40, H, W, selected_comps)
+%% Show the global signal
+plot_nmf_components_with_ethogram(B, F, etho_mat_all, 40, H, W, [1 2])
 
 %%
 before_onset = 2;
