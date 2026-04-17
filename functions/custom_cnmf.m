@@ -129,7 +129,11 @@ signal_var_full(idx) = signal_var_act;
 guide_map_2d = reshape(signal_var_full, H, W);   % H x W, noise-corrected signal variance
 
 Xr = max(Xr, 0);  % clipping to keep nonnegativity for NMF algorithm
-[Aact, C, init_info] = init_AC_from_guide_map(Xr, guide_map_2d, reshape(mask, H, W), K, opts);
+if opts.AC_init_method == "svd"
+    [Aact, C, init_info] = init_AC_svd(Xr, K);
+else
+    [Aact, C, init_info] = init_AC_from_guide_map(Xr, guide_map_2d, reshape(mask, H, W), K, opts);
+end
 clear Xr signal_var_full signal_var_act var_xr
 
 % this block is for checking the initialization of spatial footprints
@@ -604,6 +608,7 @@ function opts = set_default_opts(opts)
     def.init_active_percentile = 25;
     def.init_evt_ridge = 1e-6;
     def.AC_init_mode = "event_projection";
+    def.AC_init_method = "guide_map";  % "guide_map" or "svd"
 
     def.etaA = 1e-3;
     def.etaC = 1e-3;
@@ -762,6 +767,20 @@ dist2 = (rr - mu_r).^2 + (cc - mu_c).^2;     % Pm x K (implicit expansion)
 compact_raw = sum(sum(A .* dist2));
 end
 
+%%
+function [A, C, info] = init_AC_svd(Xr, K)
+%INIT_AC_SVD  Initialize A, C via truncated SVD of the (clipped) residual.
+%  Xr: Pm x T (nonneg-clipped background residual)
+%  Returns A (Pm x K), C (K x T), both nonneg-clipped.
+    [U, S, V] = svds(double(Xr), K);
+    sqrtS = sqrt(S);
+    A = max(U * sqrtS, 0);     % Pm x K
+    C = max(sqrtS * V', 0);    % K x T
+    A = cast(A, 'like', Xr);
+    C = cast(C, 'like', Xr);
+    info.method = "svd";
+    info.singular_values = diag(S);
+end
 
 %% L2-normalization on the columns of A
 function [A, C] = normalize_factors(A, C, opts)

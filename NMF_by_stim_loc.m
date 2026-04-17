@@ -338,6 +338,12 @@ opts.target_A_nnz_frac = 0.04;
 opts.target_A_nnz_tol = 0.01;
 opts.lambdaA_L1_adapt_rate = 8;
 opts.lambdaA_L1_min = 20;
+
+% =====================
+% Related to initialization of A and C
+% =====================
+opts.AC_init_method = "svd"; % "svd" or "guide_map"
+
 % opts.lambdaA_L1_min = 50; % for uninjured
 opts.lambdaA_L1_max = 130;
 opts.stop_if_A_all_zero = true;
