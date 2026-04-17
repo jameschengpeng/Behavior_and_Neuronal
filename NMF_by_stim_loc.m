@@ -144,7 +144,7 @@ colormap(cmap)
 clim([min(evt_domain_projection_for_plot(isfinite(evt_domain_projection_for_plot))) max(evt_domain_projection_for_plot(isfinite(evt_domain_projection_for_plot)))])  % ignore NaNs for scaling
 colorbar
 %%
-% clear evt_all subs
+clear evt_all subs
 
 %% check the synchrony of signals from different locations in the FOV; The FOV is divided into 6 patches by geographical locations
 n_select = 2000; % choose number of pixels to average
@@ -339,16 +339,16 @@ opts.target_A_nnz_tol = 0.01;
 opts.lambdaA_L1_adapt_rate = 8;
 opts.lambdaA_L1_min = 20;
 
-% =====================
-% Related to initialization of A and C
-% =====================
-opts.AC_init_method = "svd"; % "svd" or "guide_map"
-
 % opts.lambdaA_L1_min = 50; % for uninjured
 opts.lambdaA_L1_max = 130;
 opts.stop_if_A_all_zero = true;
 opts.require_target_A_nnz_for_stop = true;
 opts.rollback_on_A_nnz_undershoot = true;
+
+% =====================
+% Related to initialization of A and C
+% =====================
+opts.AC_init_method = "svd"; % "svd" or "guide_map"
 %% train on a small portion of videos, to figure out the A matrix
 subset_cutting_points = cumsum(video_lengths);
 subset_cutting_points = [0; subset_cutting_points];
