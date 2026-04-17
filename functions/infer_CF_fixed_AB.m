@@ -106,17 +106,7 @@ if use_background && opts.enforce_F_quantile_baseline
         'numel(opts.F_quantile_ref) must equal number of background rows r.');
 end
 
-% Temporal smoothness operator D'D (T x T)
-DtD = build_DtD(T);
-if isa(X, 'single')
-    % Some MATLAB versions do not allow single() cast on sparse matrices.
-    % Keep DtD as-is if casting is unsupported.
-    try
-        DtD = single(DtD);
-    catch
-        % fallback: leave DtD as sparse double
-    end
-end
+% Temporal smoothness: matrix-free apply_DtD (no T x T matrix needed).
 
 % ---------------------------
 % Initialization
@@ -170,47 +160,55 @@ info.relRecon = zeros(opts.maxIter,1);
 % ---------------------------
 prevObj = inf;
 
+% Pre-compute Gram matrices (A and B are fixed, so these are constant).
+AAt  = Aact' * Aact;                             % K x K
+if use_background
+    BtB  = Bact' * Bact;                         % r x r  (no ridge)
+end
+
+% Pre-compute step sizes (constant because A, B never change).
+if opts.use_adaptive_steps
+    LipC = norm(AAt, 2) + opts.lambdaC_smooth * 4;
+    etaC0 = 0.9 / (LipC + eps);
+    if use_background && opts.update_F
+        LipF = norm(BtB, 2) + opts.lambdaF_smooth * 4;
+        etaF0 = 0.9 / (LipF + eps);
+    end
+else
+    etaC0 = opts.etaC;
+    etaF0 = opts.etaF;
+end
+
 for it = 1:opts.maxIter
 
-    % ===== Step sizes (with safer spectral-norm estimates)
-    if opts.use_adaptive_steps
-        % LipC ~ ||A'A||_2 + lambdaC*||DtD||_2 (||DtD||_2 <= 4)
-        AAt  = Aact' * Aact;                 % K x K
-        LipC = norm(AAt, 2) + opts.lambdaC_smooth * 4;
-        etaC = 0.9 / (LipC + eps);
-        
-        if use_background && opts.update_F
-            BtB = Bact' * Bact;              % r x r
-            % LipF ~ ||B'B||_2 + lambdaF*||DtD||_2
-            LipF = norm(BtB, 2) + opts.lambdaF_smooth * 4;
-            etaF = 0.9 / (LipF + eps);
-        end
-    else
-        etaC = opts.etaC;
-        etaF = opts.etaF;
+    % Reset step sizes each iteration (backtracking may shrink within iter).
+    etaC = etaC0;
+    if use_background && opts.update_F
+        etaF = etaF0;
     end
 
     % =========================
     % (1) Update C (projected gradient + smoothness)
     % =========================
     for s = 1:opts.innerC
-        % grad wrt C: A'*(A*C + B*F - X) + lambdaC*(C*DtD)
-        R = (Aact*C + Bact*F) - X;
-        gradC = (Aact' * R) + opts.lambdaC_smooth * apply_DtD_right(C, DtD);
-        
+        R = Aact*C + Bact*F - X;                                     % Pm x T
+        gradC = (Aact' * R) + opts.lambdaC_smooth * apply_DtD(C);    % K x T
+
         Cnew = max(0, C - etaC * gradC);
 
         if opts.backtracking
-            % backtrack if objective increases
-            [objOld] = objective_val(X, Aact, C, Bact, F, DtD, opts);
-            [objNew] = objective_val(X, Aact, Cnew, Bact, F, DtD, opts);
+            objOld = objective_from_residual(R, C, F, opts);
+            Rnew = R + Aact*(Cnew - C);                               % rank-K update
+            objNew = objective_from_residual(Rnew, Cnew, F, opts);
             bt = 0;
             while objNew > objOld && bt < opts.maxBacktrack
                 etaC = etaC * 0.5;
                 Cnew = max(0, C - etaC * gradC);
-                objNew = objective_val(X, Aact, Cnew, Bact, F, DtD, opts);
+                Rnew = R + Aact*(Cnew - C);
+                objNew = objective_from_residual(Rnew, Cnew, F, opts);
                 bt = bt + 1;
             end
+            R = Rnew;  % keep accepted residual
         end
 
         C = Cnew;
@@ -220,32 +218,31 @@ for it = 1:opts.maxIter
     % (2) Update F (background temporal, projected gradient + smoothness)
     % =========================
     if use_background && opts.update_F
-        AX = Aact * C;
-        R0pos = max(X - AX, 0);
         use_nonovershoot_F = opts.enforce_background_nonovershoot && (r == 1);
 
         if use_nonovershoot_F
-            R0 = X - AX;
+            R0 = X - Aact * C;
             F = fit_rank1_nonovershoot(Bact, R0, opts_bg);
         else
-            BtB = (Bact' * Bact) + opts.bg_eps * eye(r, 'like', Bact);
-            BR = Bact' * R0pos;
-
             for s = 1:opts.innerF
-                gradF = (BtB * F - BR) + opts.lambdaF_smooth * apply_DtD_right(F, DtD);
+                R = Aact*C + Bact*F - X;                              % Pm x T
+                gradF = (Bact' * R) + opts.lambdaF_smooth * apply_DtD(F); % r x T
 
                 Fnew = max(0, F - etaF * gradF);
 
                 if opts.backtracking
-                    [objOld] = objective_val(X, Aact, C, Bact, F, DtD, opts);
-                    [objNew] = objective_val(X, Aact, C, Bact, Fnew, DtD, opts);
+                    objOld = objective_from_residual(R, C, F, opts);
+                    Rnew = R + Bact*(Fnew - F);                        % rank-r update
+                    objNew = objective_from_residual(Rnew, C, Fnew, opts);
                     bt = 0;
                     while objNew > objOld && bt < opts.maxBacktrack
                         etaF = etaF * 0.5;
                         Fnew = max(0, F - etaF * gradF);
-                        objNew = objective_val(X, Aact, C, Bact, Fnew, DtD, opts);
+                        Rnew = R + Bact*(Fnew - F);
+                        objNew = objective_from_residual(Rnew, C, Fnew, opts);
                         bt = bt + 1;
                     end
+                    R = Rnew;  % keep accepted residual
                 end
 
                 F = Fnew;
@@ -261,11 +258,12 @@ for it = 1:opts.maxIter
         end
     end
 
-    % ---- Diagnostics
-    obj = objective_val(X, Aact, C, Bact, F, DtD, opts);
+    % ---- Diagnostics (reuse cached R or recompute once)
+    R = Aact*C + Bact*F - X;
+    obj = objective_from_residual(R, C, F, opts);
     info.obj(it) = obj;
 
-    relRecon = norm(X - (Aact*C + Bact*F), 'fro')^2 / (norm(X,'fro')^2 + eps);
+    relRecon = sum(R(:).^2) / (norm(X,'fro')^2 + eps);
     info.relRecon(it) = relRecon;
 
     if it > 1
@@ -351,50 +349,36 @@ function opts = set_default_opts(opts)
     opts.F_baseline_anchor_strength = min(1, max(0, opts.F_baseline_anchor_strength));
 end
 
-function obj = objective_val(X, A, C, B, F, DtD, opts)
-    R = X - (A*C + B*F);
-    fitTerm = 0.5 * (norm(R,'fro')^2);
+function obj = objective_from_residual(R, C, F, opts)
+%OBJECTIVE_FROM_RESIDUAL  Compute objective from pre-computed residual R = AC+BF-X.
+    fitTerm = 0.5 * sum(R(:).^2);
 
     smoothCTerm = 0;
     if opts.lambdaC_smooth > 0
-        CDtD = apply_DtD_right(C, DtD);
-        smoothCTerm = 0.5 * opts.lambdaC_smooth * sum(C(:) .* CDtD(:));
+        dC = diff(C, 1, 2);                  % K x (T-1)
+        smoothCTerm = 0.5 * opts.lambdaC_smooth * sum(dC(:).^2);
     end
 
     smoothFTerm = 0;
-    if opts.lambdaF_smooth > 0 && ~isempty(F)
-        FDtD = apply_DtD_right(F, DtD);
-        smoothFTerm = 0.5 * opts.lambdaF_smooth * sum(F(:) .* FDtD(:));
+    if opts.lambdaF_smooth > 0 && ~isempty(F) && numel(F) > 0
+        dF = diff(F, 1, 2);                  % r x (T-1)
+        smoothFTerm = 0.5 * opts.lambdaF_smooth * sum(dF(:).^2);
     end
 
     obj = fitTerm + smoothCTerm + smoothFTerm;
 end
 
-function DtD = build_DtD(T)
-    main = [1; 2*ones(T-2,1); 1];
-    off  = -1*ones(T-1,1);
-    offL = [off; 0];
-    offU = [0; off];
-    DtD = spdiags([offL main offU], [-1 0 1], T, T);
-end
-
-function Y = apply_DtD_right(X, DtD)
-% Compute X * DtD with compatibility for sparse-double DtD and single X.
-% Uses explicit 1D second-difference form when sparse-single mtimes is unsupported.
-
-if issparse(DtD) && isa(X, 'single')
-    [R, T] = size(X);
-    Y = zeros(R, T, 'like', X);
-
-    if T == 1
-        Y(:,1) = X(:,1);
+function Y = apply_DtD(C)
+%APPLY_DTD  Compute C * DtD without materializing the T x T matrix.
+% DtD is the tridiagonal second-difference operator D'D where D is (T-1)xT.
+% Cost: O(K*T) instead of O(K*T^2).
+    [K, T] = size(C);
+    if T <= 1
+        Y = zeros(K, T, 'like', C);
         return;
     end
-
-    Y(:,1)   = X(:,1) - X(:,2);
-    Y(:,2:T-1) = 2*X(:,2:T-1) - X(:,1:T-2) - X(:,3:T);
-    Y(:,T)   = X(:,T) - X(:,T-1);
-else
-    Y = X * DtD;
-end
+    Y = zeros(K, T, 'like', C);
+    Y(:, 2:T-1) = -C(:, 1:T-2) + 2*C(:, 2:T-1) - C(:, 3:T);
+    Y(:, 1) = C(:, 1) - C(:, 2);
+    Y(:, T) = -C(:, T-1) + C(:, T);
 end

@@ -4,7 +4,7 @@ clc
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\scalable_calcium_model_prev'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\AQuA2_code'));
-%%
+%% For CCK data
 AQuA2_file_suffix = "ManualMoCo_cropped_AQuA2"; % for cck with or without injury
 
 % % For the CCK neuronal data with injury
@@ -12,13 +12,12 @@ AQuA2_file_suffix = "ManualMoCo_cropped_AQuA2"; % for cck with or without injury
 % condensed_ethogram_scoring_path = "F:\Mouse_behavior_data\D21\Condensed_EthogramScoring";
 % preprocessed_storage_path = "F:\Mouse_behavior_data\D21\preprocessed_data";
 % stim_scoring_filepath = "F:\Mouse_behavior_data\D21\StimulusScoring.xlsx";
-
+% 
 % For the CCK neuronal data without injury
 AQuA2_result_path = "F:\CCK_PilotData_Baseline\AQuA2";
 condensed_ethogram_scoring_path = "F:\CCK_PilotData_Baseline\BaselineBehaviorScoring";
 preprocessed_storage_path = "F:\CCK_PilotData_Baseline\preprocessed_data";
 stim_scoring_filepath = [];
-
 
 %% 
 if ~isempty(stim_scoring_filepath)

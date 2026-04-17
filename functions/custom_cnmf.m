@@ -17,7 +17,7 @@ function [A, C, info] = custom_cnmf(X_data, H, W, K, mask, evt_domain_projection
 %   - temporal smoothness on C: 0.5*lambdaC_smooth * tr(C DtD C')
 %
 % Inputs unchanged from your original implementation.
-
+tic
 if nargin < 7, opts = struct(); end
 opts = set_default_opts(opts);
 
@@ -75,15 +75,8 @@ if opts.compact_norm_coords
     col_act = (col_act - 1) / max(1, W - 1);
 end
 
-% Temporal smoothness operator D'D (T x T)
-DtD = build_DtD(T);
-if isa(X, 'single')
-    try
-        DtD = single(DtD);
-    catch
-        % fallback: keep sparse double if single sparse is unsupported
-    end
-end
+% (DtD is no longer materialized; apply_DtD applies the second-difference
+% operator in O(K*T) via the tridiagonal structure.)
 
 % ---------------------------
 % Initialization
@@ -96,12 +89,12 @@ r = opts.bg_rank;
 if opts.use_background
     bgopts = struct();
     bgopts.bg_rank = r;
-    bgopts.use_quiet_init = true;
-    bgopts.quiet_prctile = opts.bg_quiet_prctile;
     bgopts.n_refine = 1;
     bgopts.nonneg_mode = "clip";
     bgopts.eps0 = opts.bg_eps;
     bgopts.bg_noise_var = bg_noise_var_act;
+    bgopts.bg_floor_quantile = opts.bg_floor_quantile;
+    bgopts.bg_floor_noise_sigma = opts.bg_floor_noise_sigma;
     [B, F] = init_background_lowrank(X, bgopts);   % B: Pm x r, F: r x T
 
     if r == 1 && opts.bg_refine_profile_from_F
@@ -112,26 +105,32 @@ else
     F = zeros(0, T, 'like', X);
 end
 
-% Optional baseline anchoring for F during training.
-% If no reference is provided, use the initialized F quantile as reference.
-if opts.use_background && opts.enforce_F_quantile_baseline
-    if isempty(opts.F_quantile_ref)
-        F_quantile_ref_train = prctile(F, opts.F_baseline_prctile, 2);
-    else
-        assert(numel(opts.F_quantile_ref) == r, ...
-            'numel(opts.F_quantile_ref) must equal background rank r.');
-        F_quantile_ref_train = reshape(opts.F_quantile_ref, [], 1);
-    end
-else
-    F_quantile_ref_train = [];
-end
-
-
 % Residual for component init
 Xr = X - B*F;
-Xr = max(Xr, 0);  % keep nonnegativity
-[Aact, C, init_info] = init_AC_from_event_projection(Xr, evt_domain_projection_2d, reshape(mask, H, W), K, opts);
-clear Xr
+
+% Compute noise-corrected signal variance map from unclipped Xr.
+% Var(Xr_p) = Var(S_p) + sigma_p^2  (exact, no clipping approximation needed).
+% Subtracting the per-pixel noise variance recovers the pure signal variance.
+if opts.temporally_downsampled && ~isempty(bg_noise_var_act)
+    % Data was temporally downsampled: diff-based MAD would overestimate
+    % noise because the signal changes between consecutive frames.
+    % Use the precomputed noise variance (estimated at full frame rate,
+    % then divided by the downsample factor) instead.
+    noise_var_xr = double(bg_noise_var_act);                    % Pm x 1
+else
+    noise_var_xr = double(estimate_noise_var_per_pixel(Xr));    % Pm x 1
+end
+var_xr = var(double(Xr), 0, 2);                            % Pm x 1
+signal_var_act = max(var_xr - noise_var_xr, 0);            % Pm x 1
+
+% Embed active-pixel signal variance back into the full H x W image.
+signal_var_full = zeros(H * W, 1);
+signal_var_full(idx) = signal_var_act;
+guide_map_2d = reshape(signal_var_full, H, W);   % H x W, noise-corrected signal variance
+
+Xr = max(Xr, 0);  % clipping to keep nonnegativity for NMF algorithm
+[Aact, C, init_info] = init_AC_from_guide_map(Xr, guide_map_2d, reshape(mask, H, W), K, opts);
+clear Xr signal_var_full signal_var_act var_xr
 
 % this block is for checking the initialization of spatial footprints
 A_init = zeros(size(mask, 1), K, 'like', Aact);
@@ -162,14 +161,34 @@ info.relchg = zeros(opts.maxIter,1);
 info.relRecon = zeros(opts.maxIter,1);
 info.lambdaA_L1 = zeros(opts.maxIter,1);
 info.A_nnz_frac = zeros(opts.maxIter,1);
+info.relRecon_support = zeros(opts.maxIter,1);
 info.stop_reason = "maxIter";
 info.init = init_info;
 clear init_info
+
+pre_processing_elapsed = toc;
+fprintf('Preprocessing elapsed time: %.6f seconds\n', pre_processing_elapsed)
 
 % ---------------------------
 % Main loop
 % ---------------------------
 prevObj = inf;
+
+% Cache B*F outside the loop (B and F are frozen after init)
+BF = B * F;   % Pm x T (empty 0×T if no background)
+
+% Per-pixel inverse-variance weights for weighted least squares.
+% Normalized to mean 1 so the objective scale and Lipschitz constants
+% remain comparable to the unweighted case.
+w2 = 1 ./ max(double(noise_var_xr), eps);          % Pm x 1
+w2 = cast(w2 / mean(w2), 'like', X);               % normalize, match data type
+sqrt_w2 = sqrt(w2);                                % for Lipschitz computation
+clear noise_var_xr
+
+% Pre-compute ||Xr||_F^2 for relRecon (constant across iterations).
+% Using Xr = X - BF as denominator so relRecon tracks how well AC explains
+% the signal after background removal, not the BF-dominated baseline.
+normXr2 = norm(X - BF, 'fro')^2 + eps;
 
 for it = 1:opts.maxIter
     info.lambdaA_L1(it) = opts.lambdaA_L1;
@@ -179,23 +198,19 @@ for it = 1:opts.maxIter
         % lower sparsity bound can revert to the last acceptable iterate.
         A_prev_iter = Aact;
         C_prev_iter = C;
-        B_prev_iter = B;
-        F_prev_iter = F;
     end
-
-    % ---- Compute residual with current background
-    R = (Aact*C + B*F) - X;
 
     % ===== Step sizes (with safer spectral-norm estimates)
     if opts.use_adaptive_steps
-        % LipC ~ ||A'A||_2 + lambdaC*||DtD||_2 (||DtD||_2 <= 4)
-        AAt  = Aact' * Aact;                 % K x K
+        % LipC ~ ||A' diag(w2) A||_2 + lambdaC*||DtD||_2 (||DtD||_2 <= 4)
+        Aw   = sqrt_w2 .* Aact;              % Pm x K, weighted
+        AAt  = Aw' * Aw;                     % K x K, = A' * diag(w2) * A
         LipC = norm(AAt, 2) + opts.lambdaC_smooth * 4;
         etaC = 0.9 / (LipC + eps);
 
-        % LipA ~ ||CC'||_2 + lambdaA*||L||_2 + excl
+        % LipA ~ max(w2)*||CC'||_2 + lambdaA*||L||_2 + excl
         CCt  = C * C';
-        LipA = norm(CCt, 2);
+        LipA = max(w2) * norm(CCt, 2);
         if opts.lambdaA_lap > 0
             dmax = opts.neighborhood;     % 4 or 8
             LipL = 2 * dmax;              % safe bound for ||L||_2
@@ -218,113 +233,35 @@ for it = 1:opts.maxIter
     % (1) Update C (projected gradient + smoothness)
     % =========================
     for s = 1:opts.innerC
-        % grad wrt C: A'*(A*C + B*F - X) + lambdaC*(C*DtD)
-        R = (Aact*C + B*F) - X;
-        gradC = (Aact' * R) + opts.lambdaC_smooth * (C * DtD);
+        R = Aact*C + BF - X;                                     % Pm x T
+        gradC = (Aact' * (w2 .* R)) + opts.lambdaC_smooth * apply_DtD(C); % K x T
 
         Cnew = max(0, C - etaC * gradC);
 
         if opts.backtracking
-            % backtrack if objective increases
-            [objOld] = objective_val(X, Aact, C, B, F, L, DtD, opts, guide_act, row_act, col_act);
-            [objNew] = objective_val(X, Aact, Cnew, B, F, L, DtD, opts, guide_act, row_act, col_act);
+            objOld = objective_from_residual(R, Aact, C, L, opts, guide_act, row_act, col_act, w2);
+            Rnew = R + Aact*(Cnew - C);                           % cheap rank-K update
+            objNew = objective_from_residual(Rnew, Aact, Cnew, L, opts, guide_act, row_act, col_act, w2);
             bt = 0;
             while objNew > objOld && bt < opts.maxBacktrack
                 etaC = etaC * 0.5;
                 Cnew = max(0, C - etaC * gradC);
-                objNew = objective_val(X, Aact, Cnew, B, F, L, DtD, opts, guide_act, row_act, col_act);
+                Rnew = R + Aact*(Cnew - C);
+                objNew = objective_from_residual(Rnew, Aact, Cnew, L, opts, guide_act, row_act, col_act, w2);
                 bt = bt + 1;
             end
+            R = Rnew;  % keep the accepted residual
         end
 
         C = Cnew;
     end
 
     % =========================
-    % (2) Update background/global term
-    % =========================
-    if opts.use_background
-        AX = Aact*C;
-        R0pos = max(X - AX, 0);
-
-        if opts.update_background
-            % ---- Optional B update on ALL frames using current F
-            G   = (F * F');
-            RHS = (R0pos * F');
-
-            % Lipschitz bound for B: ||F*F'||_2 + lambdaB*||L||_2
-            LipL = 2 * opts.neighborhood;
-            LipB = norm(G, 2) + opts.lambdaB_lap * LipL;
-            etaB = 0.9 / (LipB + eps);
-
-            for sB = 1:opts.innerB
-                gradB = (B * G - RHS) + opts.lambdaB_lap * (L * B);
-                B = max(0, B - etaB * gradB);
-            end
-        end
-
-        if opts.update_F
-            % ---- Update F on ALL frames using full residual (with B fixed)
-            BtB = (B' * B) + opts.bg_eps * eye(r, 'like', B);
-            BR  = (B' * R0pos);
-            use_nonovershoot_F = opts.enforce_background_nonovershoot && r == 1;
-            if use_nonovershoot_F
-                R0 = X - AX;
-                F_cap = fit_rank1_nonovershoot(B, R0, opts_bg);
-                clear R0
-            end
-
-            if opts.lambdaF_smooth > 0 && ~use_nonovershoot_F
-                % Solve: min_F 0.5||R0pos - B*F||_F^2 + 0.5*lambdaF*tr(F*DtD*F')
-                % via projected-gradient (nonnegative F)
-                LipF = norm(BtB, 2) + opts.lambdaF_smooth * 4;
-                etaF = 0.9 / (LipF + eps);
-
-                for sF = 1:opts.innerF
-                    gradF = (BtB * F - BR) + opts.lambdaF_smooth * (F * DtD);
-                    F = max(0, F - etaF * gradF);
-                end
-            elseif use_nonovershoot_F
-                % In conservative rank-1 mode, use a noise-corrected lower-tail
-                % estimate of the shared floor instead of an average-error fit.
-                F = F_cap;
-            else
-                % Closed-form NNLS proxy when no temporal smoothing is requested
-                Lb = chol(BtB, 'lower');
-                F = Lb'\(Lb\BR);
-                F = max(F, 0);
-            end
-        else
-            use_nonovershoot_F = false;
-        end
-    
-        % Optional stabilization: normalize columns of B, rescale F
-        if opts.update_background
-            coln = sqrt(sum(B.^2,1)) + opts.bg_eps;
-            B = B ./ coln;
-            F = F .* coln';
-        end
-
-        % Optional quantile-baseline anchoring (row-wise) to prevent F drift.
-        if opts.update_F && opts.enforce_F_quantile_baseline && ~isempty(F_quantile_ref_train)
-            q_cur = prctile(F, opts.F_baseline_prctile, 2);      % r x 1
-            delta = cast(F_quantile_ref_train - q_cur, 'like', F);
-            F = max(0, F + opts.F_baseline_anchor_strength * delta);
-        end
-
-        if opts.update_F && use_nonovershoot_F && ~isempty(F)
-            F = min(F, F_cap);
-        end
-
-        clear AX R0pos
-    end
-
-    % =========================
-    % (3) Update A (prox-grad: fit + lap + excl, then L1+nonneg prox)
+    % (2) Update A (prox-grad: fit + lap + excl, then L1+nonneg prox)
     % =========================
     for s = 1:opts.innerA
-        R = (Aact*C + B*F) - X;          % Pm x T
-        gradA = (R * C');                % Pm x K
+        R = Aact*C + BF - X;                 % Pm x T
+        gradA = ((w2 .* R) * C');            % Pm x K
 
         if opts.lambdaA_lap > 0
             gradA = gradA + opts.lambdaA_lap * (L * Aact);
@@ -358,7 +295,6 @@ for it = 1:opts.maxIter
             gradA = gradA + gradGuide;
         end
 
-
         Anew = Aact - etaA * gradA;
 
         if opts.lambdaA_L1 > 0
@@ -368,8 +304,9 @@ for it = 1:opts.maxIter
         end
 
         if opts.backtracking
-            objOld = objective_val(X, Aact, C, B, F, L, DtD, opts, guide_act, row_act, col_act);
-            objNew = objective_val(X, Anew, C, B, F, L, DtD, opts, guide_act, row_act, col_act);
+            objOld = objective_from_residual(R, Aact, C, L, opts, guide_act, row_act, col_act, w2);
+            Rnew = R + (Anew - Aact)*C;                           % cheap rank-K update
+            objNew = objective_from_residual(Rnew, Anew, C, L, opts, guide_act, row_act, col_act, w2);
             bt = 0;
             while objNew > objOld && bt < opts.maxBacktrack
                 etaA = etaA * 0.5;
@@ -379,9 +316,11 @@ for it = 1:opts.maxIter
                 else
                     Anew = max(Anew, 0);
                 end
-                objNew = objective_val(X, Anew, C, B, F, L, DtD, opts, guide_act, row_act, col_act);
+                Rnew = R + (Anew - Aact)*C;
+                objNew = objective_from_residual(Rnew, Anew, C, L, opts, guide_act, row_act, col_act, w2);
                 bt = bt + 1;
             end
+            R = Rnew;  % keep the accepted residual
         end
 
         Aact = Anew;
@@ -392,12 +331,24 @@ for it = 1:opts.maxIter
         [Aact, C] = normalize_factors(Aact, C, opts);
     end
 
-    % ---- Diagnostics
-    obj = objective_val(X, Aact, C, B, F, L, DtD, opts, guide_act, row_act, col_act);
+    % ---- Diagnostics (reuse cached R or recompute once after normalization)
+    R = Aact*C + BF - X;
+    obj = objective_from_residual(R, Aact, C, L, opts, guide_act, row_act, col_act, w2);
     info.obj(it) = obj;
 
-    relRecon = norm(X - (Aact*C + B*F), 'fro')^2 / (norm(X,'fro')^2 + eps);
+    % R = AC + BF - X, so AC - Xr = R where Xr = X - BF.
+    % relRecon = ||AC - Xr||^2 / ||Xr||^2  (all active pixels)
+    relRecon = sum(R(:).^2) / normXr2;
     info.relRecon(it) = relRecon;
+
+    % relRecon_support: same metric restricted to the footprint of A.
+    % Shows how well AC explains Xr where the model claims neurons exist.
+    support_mask = any(Aact > 0, 2);    % Pm x 1 logical
+    R_sup = R(support_mask, :);
+    Xr_sup = X(support_mask, :) - BF(support_mask, :);
+    relRecon_support = sum(R_sup(:).^2) / (sum(Xr_sup(:).^2) + eps);
+    info.relRecon_support(it) = relRecon_support;
+
     info.A_nnz_frac(it) = nnz(Aact) / max(1, numel(Aact));
 
     if it > 1
@@ -412,10 +363,10 @@ for it = 1:opts.maxIter
         % =========================
         % ---- A diagnostics ----
         % =========================
-        Rtmp = (Aact*C + B*F) - X;
+        % R is already (Aact*C + BF - X) from diagnostics above
     
         % Fit gradient
-        gradA_fit = (Rtmp * C');
+        gradA_fit = ((w2 .* R) * C');
     
         % Laplacian gradient
         gradA_lap = zeros(size(Aact), 'like', Aact);
@@ -460,23 +411,19 @@ for it = 1:opts.maxIter
         % =========================
         % ---- C diagnostics ----
         % =========================
-        gradC_fit = Aact' * Rtmp;
+        gradC_fit = Aact' * (w2 .* R);
     
         gradC_smooth = zeros(size(C), 'like', C);
         if opts.lambdaC_smooth > 0
-            gradC_smooth = opts.lambdaC_smooth * (C * DtD);
+            gradC_smooth = opts.lambdaC_smooth * apply_DtD(C);
         end
     
         % =========================
         % ---- F diagnostics ----
         % =========================
         gradF_fit = zeros(size(F), 'like', F);
-        gradF_smooth = zeros(size(F), 'like', F);
         if ~isempty(F)
-            gradF_fit = B' * Rtmp;
-            if opts.lambdaF_smooth > 0
-                gradF_smooth = opts.lambdaF_smooth * (F * DtD);
-            end
+            gradF_fit = B' * (w2 .* R);
         end
     
         % AQuA2 guide diagnostics
@@ -499,19 +446,21 @@ for it = 1:opts.maxIter
         % =========================
         % ---- Print ----
         % =========================
-        fprintf(['Iter %4d | obj %.4e | relRecon %.4g | ||A|| %.3e nnzA %d | ||C|| %.3e | bg %d\n' ...
+        fprintf(['Iter %4d | obj %.4e | ||A|| %.3e nnzA %d | ||C|| %.3e | bg %d\n' ...
+                 '   relRecon(Xr, all px) %.4g | relRecon(Xr, footprint) %.4g\n' ...
              '   A-grad:  fit %.3e | lap %.3e | excl %.3e | compact %.3e (ratio %.3f) | L1obj %.3e | prox %.3e | tau %.3e\n' ...
                  '   A-nnz:   count/col [%s]\n' ...
                  '   A-nnz%%:  pct/col   [%s]\n' ...
                  '   C-grad:  fit %.3e | smooth %.3e\n' ...
-                 '   F-grad:  fit %.3e | smooth %.3e\n' ...
+                 '   F-grad:  fit %.3e\n' ...
                  '   Guide:   %.3e | CompactObj(raw) %.3e\n'], ...
-                it, obj, relRecon, norm(Aact,'fro'), nnz(Aact), norm(C,'fro'), opts.use_background, ...
+                it, obj, norm(Aact,'fro'), nnz(Aact), norm(C,'fro'), opts.use_background, ...
+                relRecon, relRecon_support, ...
             norm(gradA_fit,'fro'), norm(gradA_lap,'fro'), norm(gradA_excl,'fro'), norm(gradA_compact,'fro'), ...
                 compact_grad_ratio, l1_obj, l1_shrink, tau, ...
                 nnzA_col_str, pctA_col_str, ...
                 norm(gradC_fit,'fro'), norm(gradC_smooth,'fro'), ...
-                norm(gradF_fit,'fro'), norm(gradF_smooth,'fro'), ...
+                norm(gradF_fit,'fro'), ...
                 norm(grad_guide,'fro'), compact_obj);
 
         disp('-----------')
@@ -523,6 +472,7 @@ for it = 1:opts.maxIter
         info.obj = info.obj(1:it);
         info.relchg = info.relchg(1:it);
         info.relRecon = info.relRecon(1:it);
+        info.relRecon_support = info.relRecon_support(1:it);
         info.lambdaA_L1 = info.lambdaA_L1(1:it);
         info.A_nnz_frac = info.A_nnz_frac(1:it);
         info.stop_reason = "A_all_zero";
@@ -540,13 +490,12 @@ for it = 1:opts.maxIter
 
             Aact = A_prev_iter;
             C = C_prev_iter;
-            B = B_prev_iter;
-            F = F_prev_iter;
             prevObj = info.obj(it - 1);
 
             info.obj = info.obj(1:it-1);
             info.relchg = info.relchg(1:it-1);
             info.relRecon = info.relRecon(1:it-1);
+            info.relRecon_support = info.relRecon_support(1:it-1);
             info.lambdaA_L1 = info.lambdaA_L1(1:it-1);
             info.A_nnz_frac = info.A_nnz_frac(1:it-1);
             info.stop_reason = "A_nnz_undershoot_rollback";
@@ -591,6 +540,7 @@ for it = 1:opts.maxIter
         info.obj = info.obj(1:it);
         info.relchg = info.relchg(1:it);
         info.relRecon = info.relRecon(1:it);
+        info.relRecon_support = info.relRecon_support(1:it);
         info.lambdaA_L1 = info.lambdaA_L1(1:it);
         info.A_nnz_frac = info.A_nnz_frac(1:it);
         info.stop_reason = "relchg_tol";
@@ -610,231 +560,13 @@ info.F = F;
 end
 
 %% ======================================================================
-% Helpers
+% Helpers (init_background_lowrank, refine_rank1_background_profile,
+%  build_DtD, build_laplacian_active, soft_thresh_nonneg,
+%  temporal_gaussian_smooth are in separate .m files in this folder)
 % ======================================================================
-function [B, F, info] = init_background_lowrank(X, opts)
-%INIT_BACKGROUND_LOWRANK  Initialize low-rank nonnegative background B,F for CNMF/NMF.
-%
-% Model: X ≈ B*F,  with B>=0, F>=0
-%
-% Inputs
-%   X    : (Pm x T) double, active-pixel matrix (can be dF/F)
-%   opts : struct with fields (optional)
-%          - bg_rank        (default 3)   : background rank r
-%          - use_quiet_init (default true): use "quiet frames" for init SVD
-%          - quiet_prctile  (default 20)  : percentile for quiet frames (bottom p%)
-%          - n_refine       (default 1)   : number of alternating refinement steps
-%          - nonneg_mode    (default "clip") : "clip" or "shift" or "none"
-%          - eps0           (default 1e-12)
-%
-% Outputs
-%   B    : (Pm x r) background spatial modes
-%   F    : (r x T) background temporal modes
-%   info : struct with fields:
-%          - quiet_idx (1 x T logical)
-%          - Xpos      (Pm x T) nonnegative version used for init
-%          - recon_err (scalar) ||Xpos - B*F||_F / ||Xpos||_F after init
-
-if nargin < 2, opts = struct(); end
-opts = set_defaults_for_background(opts);
-
-[Pm, T] = size(X);
-r = opts.bg_rank;
-
-% Nonnegativity handling for background init
-Xpos = X;
-switch string(opts.nonneg_mode)
-    case "clip"
-        Xpos = max(Xpos, 0);
-    case "shift"
-        Xpos = Xpos - min(Xpos(:));
-    case "none"
-        % leave as-is (not recommended for this helper; B,F are nonneg)
-        % but we still clip negatives for stability in init
-        Xpos = max(Xpos, 0);
-    otherwise
-        error('opts.nonneg_mode must be "clip", "shift", or "none".');
-end
-
-% Quiet frames selection
-quiet_idx = true(1, T);
-if opts.use_quiet_init
-    g = mean(Xpos, 1); % 1 x T
-    thr = prctile(g, opts.quiet_prctile);
-    quiet_idx = (g <= thr);
-    % Ensure we have enough frames
-    if nnz(quiet_idx) < max(10, 2*r)
-        quiet_idx = true(1, T);
-    end
-end
-
-Xq = Xpos(:, quiet_idx);
-
-% For rank-1 background, use a uniform spatial profile to represent a
-% biologically shared field-wide response rather than a data-adaptive mode.
-if r == 1
-    B = ones(Pm, 1, 'like', Xpos);
-    B = B / (norm(B) + opts.eps0);
-    F = fit_rank1_nonovershoot(B, Xpos, opts); % 1 x T
-else
-    % SVD-based init on quiet frames for multi-rank backgrounds.
-    try
-        [U,S,~] = svds(Xq, r);
-    catch
-        [U,S,~] = svd(Xq, 'econ');
-        U = U(:, 1:r);
-        S = S(1:r, 1:r);
-    end
-
-    B = max(0, U * sqrt(S));      % Pm x r
-    BtB = (B' * B) + opts.eps0 * eye(r, 'like', B);
-    F = max(0, (BtB \ (B' * Xpos))); % r x T
-end
-
-% Optional refinement:
-% keep B tied to quiet frames, then refit F on all frames.
-for k = 1:opts.n_refine
-    if r == 1
-        % Keep the rank-1 global profile uniform; only refresh F.
-        F = fit_rank1_nonovershoot(B, Xpos, opts);  % 1 x T
-    else
-        Fq = F(:, quiet_idx);
-        FFt = (Fq * Fq') + opts.eps0 * eye(r, 'like', Fq);
-        B = max(0, (Xq * Fq') / FFt);      % Pm x r, quiet-frame only
-
-        BtB = (B' * B) + opts.eps0 * eye(r, 'like', B);
-        F = max(0, (BtB \ (B' * Xpos)));  % r x T
-    end
-end
-
-% Normalize columns of B to reduce scale ambiguity
-colnorm = sqrt(sum(B.^2, 1)) + opts.eps0;
-B = B ./ colnorm;
-F = F .* colnorm';
-
-% Diagnostics (only when caller requests the third output)
-if nargout >= 3
-    den = norm(Xpos, 'fro') + opts.eps0;
-    info = struct();
-    info.quiet_idx = quiet_idx;
-    info.Xpos = Xpos;
-    info.recon_err = norm(Xpos - B*F, 'fro') / den;
-else
-    info = struct();
-end
-end
-
-function [B, F] = refine_rank1_background_profile(X, B, F, H, W, mask, opts)
-% Refine a rank-1 background profile cheaply from lower quantiles of X./F.
-% This approximates a per-pixel lower-quantile regression while keeping B
-% smooth and close to a broad field-wide profile.
-
-if isfield(opts, 'bg_eps')
-    eps_bg = opts.bg_eps;
-elseif isfield(opts, 'eps0')
-    eps_bg = opts.eps0;
-else
-    eps_bg = 1e-12;
-end
-
-if size(B, 2) ~= 1 || isempty(F)
-    return;
-end
-
-mask = reshape(mask, [], 1) ~= 0;
-idx = find(mask);
-B = max(B, 0);
-
-for it = 1:opts.bg_profile_n_alternations
-    f = double(F(1, :));
-    fmax = max(f);
-    if ~(isfinite(fmax) && fmax > eps_bg)
-        break;
-    end
-
-    informative = (f >= opts.bg_profile_min_relF * fmax);
-    if nnz(informative) < opts.bg_profile_min_frames
-        [~, order] = sort(f, 'descend');
-        keep_n = min(numel(order), max(opts.bg_profile_min_frames, ceil(0.1 * numel(order))));
-        informative = false(size(f));
-        informative(order(1:keep_n)) = true;
-    end
-
-    f_use = max(f(informative), eps_bg);
-    ratio = double(X(:, informative)) ./ reshape(f_use, 1, []);
-    b_raw = prctile(ratio, 100 * opts.bg_profile_quantile, 2);
-    b_raw = max(b_raw, 0);
-
-    if opts.bg_profile_smooth_sigma > 0
-        b_full = zeros(H * W, 1);
-        b_full(idx) = b_raw;
-        b_img = reshape(b_full, H, W);
-
-        mask_img = reshape(double(mask), H, W);
-        num = imgaussfilt(b_img .* mask_img, opts.bg_profile_smooth_sigma);
-        den = imgaussfilt(mask_img, opts.bg_profile_smooth_sigma);
-        b_img = num ./ max(den, eps_bg);
-        b_raw = b_img(mask);
-    end
-
-    if opts.bg_profile_shrink_uniform > 0
-        b_mean = mean(b_raw);
-        b_raw = (1 - opts.bg_profile_shrink_uniform) * b_raw + opts.bg_profile_shrink_uniform * b_mean;
-    end
-
-    B = cast(max(b_raw, 0), 'like', X);
-    B = B / (norm(B) + eps_bg);
-    F = fit_rank1_nonovershoot(B, X, opts);
-end
-end
-
-%% -----------------------
-% local helper
-% -----------------------
-function opts = set_defaults_for_background(opts)
-def.bg_rank = 3;
-def.use_quiet_init = true;
-def.quiet_prctile = 20;
-def.n_refine = 1;
-def.nonneg_mode = "none"; % safest for dF/F init
-def.eps0 = 1e-12;
-def.bg_floor_quantile = 0.05;
-def.bg_floor_noise_sigma = [];
-def.bg_refine_profile_from_F = false;
-def.bg_profile_quantile = 0.1;
-def.bg_profile_min_relF = 0.2;
-def.bg_profile_min_frames = 50;
-def.bg_profile_smooth_sigma = 20;
-def.bg_profile_shrink_uniform = 0.5;
-def.bg_profile_n_alternations = 1;
-
-f = fieldnames(def);
-for i = 1:numel(f)
-    if ~isfield(opts, f{i})
-        opts.(f{i}) = def.(f{i});
-    end
-end
-
-% Guardrails
-opts.bg_rank = max(1, round(opts.bg_rank));
-opts.quiet_prctile = min(50, max(1, opts.quiet_prctile));
-opts.n_refine = max(0, round(opts.n_refine));
-if opts.bg_floor_quantile > 1
-    opts.bg_floor_quantile = opts.bg_floor_quantile / 100;
-end
-opts.bg_floor_quantile = min(0.49, max(0.001, opts.bg_floor_quantile));
-end
-
-
 
 %%
 function opts = set_default_opts(opts)
-    % Backward compatibility:
-    % if old field `quiet_prctile` is provided, map it to bg_quiet_prctile
-    if isfield(opts, 'quiet_prctile') && ~isfield(opts, 'bg_quiet_prctile')
-        opts.bg_quiet_prctile = opts.quiet_prctile;
-    end
-
     def.maxIter = 200;
     def.minIter = 50;
     def.tol = 1e-5;
@@ -858,19 +590,10 @@ function opts = set_default_opts(opts)
     def.compact_eps = 1e-12;
     def.compact_norm_coords = true;
     def.lambdaC_smooth = 1e-4;
-    def.lambdaF_smooth = 1e-2; % global/background temporal smoothness
-    def.enforce_background_nonovershoot = false;
     def.bg_floor_quantile = 0.05;
     def.bg_floor_noise_sigma = [];
     def.bg_noise_var = [];
-    def.enforce_F_quantile_baseline = false;
-    def.F_baseline_prctile = 5;
-    def.F_quantile_ref = [];
-    def.F_baseline_anchor_strength = 0.5;
-    def.lambdaB_lap = 5e-3;   % start ~ 5–20x lambdaA_lap
-    def.innerB = 3;           % how many gradient steps for B
-    def.innerF = 3;           % how many projected-gradient steps for F
-    def.update_F = true;
+    def.temporally_downsampled = false; % set true when data was temporally binned
 
     % the guide from AQuA2 events' projections
     def.lambdaA_guide = 0;        % guide strength (OFF by default)
@@ -878,9 +601,7 @@ function opts = set_default_opts(opts)
     def.guide_eps = 1e-12;
     def.init_evt_sigma = 8;
     def.init_evt_min_peak_dist = 200;
-    def.init_evt_min_frac = 0.05;
-    def.init_evt_max_frac = 0.10;
-    def.init_evt_threshold_levels = 40;
+    def.init_active_percentile = 25;
     def.init_evt_ridge = 1e-6;
     def.AC_init_mode = "event_projection";
 
@@ -904,7 +625,6 @@ function opts = set_default_opts(opts)
     def.bg_rank = 3;
     def.bg_eps = 1e-12;          % small ridge for SPD solves
     def.bg_init_mode = "lowrank";
-    def.update_background = true;
     def.bg_refine_profile_from_F = false;
     def.bg_profile_quantile = 0.1;
     def.bg_profile_min_relF = 0.2;
@@ -930,7 +650,6 @@ function opts = set_default_opts(opts)
         end
     end
 
-    % Guardrail for quiet frame percentile used by background updates
     opts.normalize_prctile = min(100, max(50, opts.normalize_prctile));
     opts.target_A_nnz_frac = min(1, max(0, opts.target_A_nnz_frac));
     opts.target_A_nnz_tol = min(1, max(0, opts.target_A_nnz_tol));
@@ -955,20 +674,18 @@ function opts = set_default_opts(opts)
     opts.bg_profile_smooth_sigma = max(0, opts.bg_profile_smooth_sigma);
     opts.bg_profile_shrink_uniform = min(1, max(0, opts.bg_profile_shrink_uniform));
     opts.bg_profile_n_alternations = max(0, round(opts.bg_profile_n_alternations));
-    if opts.F_baseline_prctile <= 1
-        opts.F_baseline_prctile = 100 * opts.F_baseline_prctile;
-    end
-    opts.F_baseline_prctile = min(100, max(0, opts.F_baseline_prctile));
-    opts.F_baseline_anchor_strength = min(1, max(0, opts.F_baseline_anchor_strength));
 end
 %%
-function obj = objective_val(X, A, C, B, F, L, DtD, opts, guide_act, row_act, col_act)
-    R = X - (A*C + B*F);
-    fitTerm = 0.5 * (norm(R,'fro')^2);
+function obj = objective_from_residual(R, A, C, L, opts, guide_act, row_act, col_act, w2)
+%OBJECTIVE_FROM_RESIDUAL  Compute objective from pre-computed residual R = AC+BF-X.
+% Avoids rebuilding the Pm x T residual; all terms use R, A, C directly.
+% w2 (Pm x 1): per-pixel inverse-variance weights (mean-normalised to 1).
+    fitTerm = 0.5 * (w2' * sum(R.^2, 2)); % weighted fit: sum_p w2_p * ||R_p||^2
 
     lapTerm = 0;
     if opts.lambdaA_lap > 0
-        lapTerm = 0.5 * opts.lambdaA_lap * trace(A' * (L * A));
+        LA = L * A;                         % sparse Pm x K
+        lapTerm = 0.5 * opts.lambdaA_lap * sum(A(:) .* LA(:));  % = trace(A'*L*A)
     end
 
     l1Term = opts.lambdaA_L1 * sum(A(:));
@@ -985,20 +702,17 @@ function obj = objective_val(X, A, C, B, F, L, DtD, opts, guide_act, row_act, co
         compactTerm = opts.lambdaA_compact * compact_raw;
     end
 
+    % Temporal smoothness: 0.5*lambda*||diff(C)||^2 = 0.5*lambda*trace(C*DtD*C')
     smoothCTerm = 0;
     if opts.lambdaC_smooth > 0
-        smoothCTerm = 0.5 * opts.lambdaC_smooth * trace(C * (DtD * C'));
-    end
-
-    smoothFTerm = 0;
-    if opts.lambdaF_smooth > 0 && ~isempty(F)
-        smoothFTerm = 0.5 * opts.lambdaF_smooth * trace(F * (DtD * F'));
+        dC = diff(C, 1, 2);                 % K x (T-1), O(K*T)
+        smoothCTerm = 0.5 * opts.lambdaC_smooth * sum(dC(:).^2);
     end
 
     guideTerm = 0;
     if opts.lambdaA_guide > 0
         s = sum(A,2);
-        g = guide_act;   % must be accessible (see note below)
+        g = guide_act;
         
         if opts.use_guide_scale
             beta = (g' * s) / (g' * g + opts.guide_eps);
@@ -1010,7 +724,26 @@ function obj = objective_val(X, A, C, B, F, L, DtD, opts, guide_act, row_act, co
         guideTerm = 0.5 * opts.lambdaA_guide * (r' * r);
     end
 
-    obj = fitTerm + lapTerm + l1Term + exclTerm + compactTerm + smoothCTerm + smoothFTerm + guideTerm;
+    obj = fitTerm + lapTerm + l1Term + exclTerm + compactTerm + smoothCTerm + guideTerm;
+end
+
+function Y = apply_DtD(C)
+%APPLY_DTD  Compute C * DtD without materializing the T x T matrix.
+% DtD is the tridiagonal second-difference operator D'D where D is (T-1)xT.
+% C*DtD is equivalent to the 1-D convolution [1 -2 1] along each row of C,
+% with boundary handling that matches the sparse DtD exactly.
+% Cost: O(K*T) instead of O(K*T^2).
+    [K, T] = size(C);
+    if T <= 1
+        Y = zeros(K, T, 'like', C);
+        return;
+    end
+    Y = zeros(K, T, 'like', C);
+    % Interior: y(:,t) = -c(:,t-1) + 2*c(:,t) - c(:,t+1)
+    Y(:, 2:T-1) = -C(:, 1:T-2) + 2*C(:, 2:T-1) - C(:, 3:T);
+    % Boundaries: y(:,1) = c(:,1) - c(:,2), y(:,T) = -c(:,T-1) + c(:,T)
+    Y(:, 1) = C(:, 1) - C(:, 2);
+    Y(:, T) = -C(:, T-1) + C(:, T);
 end
 
 function [dist2, compact_raw] = compactness_dist2_and_term(A, row_act, col_act, eps0)
@@ -1028,67 +761,7 @@ mu_c = (cc' * A) ./ mass;                    % 1 x K
 dist2 = (rr - mu_r).^2 + (cc - mu_c).^2;     % Pm x K (implicit expansion)
 compact_raw = sum(sum(A .* dist2));
 end
-%%
-function DtD = build_DtD(T)
-    main = [1; 2*ones(T-2,1); 1];
-    off  = -1*ones(T-1,1);
-    offL = [off; 0];
-    offU = [0; off];
-    DtD = spdiags([offL main offU], [-1 0 1], T, T);
-end
-%%
-function L = build_laplacian_active(H, W, maskVec, neighborhood)
-    maskVec = reshape(maskVec, [], 1) ~= 0;
-    idxFull = find(maskVec);
-    Pm = numel(idxFull);
 
-    % Map from full-image linear index to active-pixel index
-    map = zeros(H*W, 1, 'int32');
-    map(idxFull) = int32(1:Pm);
-
-    % Row/col of every active pixel
-    [ri, ci] = ind2sub([H, W], idxFull);
-
-    % Neighbor offsets
-    if neighborhood == 8
-        offsets = int32([-1 0; 1 0; 0 -1; 0 1; -1 -1; -1 1; 1 -1; 1 1]);
-    else
-        offsets = int32([-1 0; 1 0; 0 -1; 0 1]);
-    end
-
-    nDir = size(offsets, 1);
-    src = cell(nDir, 1);
-    dst = cell(nDir, 1);
-    active_idx = (1:Pm)';
-
-    for d = 1:nDir
-        rn = ri + double(offsets(d, 1));
-        cn = ci + double(offsets(d, 2));
-
-        valid = (rn >= 1) & (rn <= H) & (cn >= 1) & (cn <= W);
-
-        nb_full = zeros(Pm, 1);
-        nb_full(valid) = sub2ind([H, W], rn(valid), cn(valid));
-
-        nb_active = zeros(Pm, 1);
-        nb_active(valid) = double(map(nb_full(valid)));
-
-        keep = valid & (nb_active > 0);
-        src{d} = active_idx(keep);
-        dst{d} = nb_active(keep);
-    end
-
-    src_all = vertcat(src{:});
-    dst_all = vertcat(dst{:});
-    Wmat = sparse(src_all, dst_all, 1, Pm, Pm);
-
-    deg = full(sum(Wmat, 2));
-    L = spdiags(deg, 0, Pm, Pm) - Wmat;
-end
-%%
-function X = soft_thresh_nonneg(X, tau)
-    X = max(0, X - tau);
-end
 
 %% L2-normalization on the columns of A
 function [A, C] = normalize_factors(A, C, opts)
@@ -1111,19 +784,4 @@ function [A, C] = normalize_factors(A, C, opts)
     C = C .* scale';
 end
 
-function Xs = temporal_gaussian_smooth(X, sigma_frames)
-if sigma_frames <= 0
-    Xs = X;
-    return;
-end
 
-half_width = max(1, ceil(3 * sigma_frames));
-t = -half_width:half_width;
-kernel = exp(-(t.^2) / (2 * sigma_frames^2));
-kernel = kernel / sum(kernel);
-
-left_pad = repmat(X(:,1), 1, half_width);
-right_pad = repmat(X(:,end), 1, half_width);
-X_pad = [left_pad, X, right_pad];
-Xs = conv2(X_pad, kernel, 'valid');
-end

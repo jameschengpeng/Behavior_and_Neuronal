@@ -2,78 +2,31 @@
 clear
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\scalable_calcium_model_prev'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
-
 %%
-preprocessed_storage_path = "F:\Mouse_behavior_data\D21\preprocessed_data"; further_smoothing = false; % injured data
-% preprocessed_storage_path = "F:\CCK_PilotData_Baseline\preprocessed_data"; further_smoothing = true; % uninjured data
-
+mouse_num = 2;
+day = 28;
+recording_type = "GGP"; % can be GGC or GGP
+AQuA2_result_path = strcat("F:\Astrocyte_data\", recording_type, "#", num2str(mouse_num), "_d", num2str(day));
+preprocessed_storage_path = fullfile(AQuA2_result_path, "preprocessed_data");
 
 stim_side = "L";
 
-if exist(fullfile(preprocessed_storage_path, stim_side, "data_combined.mat"), 'file')==2
-    saved_data = load(fullfile(preprocessed_storage_path, stim_side, "data_combined.mat"));
-    adj_dFF_all = single(saved_data.adj_dFF_all); % adj_dFF means F/F0, which is equivalent to 1 + dF/F0
-    evt_all = single(saved_data.evt_all);
-    etho_mat_all = saved_data.etho_mat_all;
-    mask_upper_half = saved_data.mask_upper_half;
-    mask_lower_half = saved_data.mask_lower_half;
-    video_lengths = saved_data.video_lengths;
-    clear saved_data
-else
-    adj_dFF_all = [];
-    evt_all = [];
-    etho_mat_all = [];
-    matFiles = dir(fullfile(preprocessed_storage_path, stim_side, "*.mat"));
-    video_lengths = zeros(numel(matFiles), 1);
-    for ii = 1:numel(matFiles)
-        filename = matFiles(ii).name;
-        filepath = fullfile(preprocessed_storage_path, stim_side, filename);
-        saved_data = load(filepath);
-        datSmo = saved_data.datSmo;
-        F0 = saved_data.F0;
-        evt_map = saved_data.evt_map;
-        condensed_ethogram_mat = saved_data.condensed_ethogram_mat;
-        mask_upper_half = saved_data.mask_upper_half;
-        mask_lower_half = saved_data.mask_lower_half;
-        
-        adj_dFF_all = cat(3, adj_dFF_all, datSmo./F0); % F/F0 = 1+dF/F0, so it is adjusted dFF
-        evt_all = cat(3, evt_all, evt_map);
-        etho_mat_all = cat(1, etho_mat_all, condensed_ethogram_mat);
-        video_lengths(ii) = size(datSmo, 3);
-        clear saved_data datSmo F0 evt_map condensed_ethogram_mat
-        fprintf(strcat('Processed file ', filename, '\n'));
-    end
-    savefile = fullfile(preprocessed_storage_path, stim_side, "data_combined.mat");
-    save(savefile, "adj_dFF_all", "evt_all", "etho_mat_all", "mask_upper_half", "mask_lower_half", "video_lengths", "-v7.3");
-end
+% assume the data has already been downsampled and combined
+saved_data = load(fullfile(preprocessed_storage_path, stim_side, "data_combined_downsampled.mat"));
+adj_dFF_all = single(saved_data.adj_dFF_all); % adj_dFF means F/F0, which is equivalent to 1 + dF/F0
+evt_all = single(saved_data.evt_all);
+etho_mat_all = saved_data.etho_mat_all;
+mask_upper_half = saved_data.mask_upper_half;
+mask_lower_half = saved_data.mask_lower_half;
+video_lengths = saved_data.video_lengths;
+noise_var_ds = saved_data.noise_var_ds;
 
-%%
-base_path = fileparts(preprocessed_storage_path);   % removes "preprocessed_data"
-stim_scoring_filepath = fullfile(base_path, 'StimulusScoring.xlsx');
-stim_scoring_table = get_stim_metadata(stim_scoring_filepath);
-% Filter rows by stim side
-rows = stim_scoring_table.StimLocation == stim_side;
-subtbl = stim_scoring_table(rows,:);
+clear saved_data
 
-% Extract numeric suffix from Data column
-data_nums = cellfun(@(x) sscanf(x,'data%d'), cellstr(subtbl.Data));
-
-% Sort suffix numbers
-[data_nums_sorted, order] = sort(data_nums);
-
-k = numel(data_nums_sorted);
-values = 1:k;
-
-% Build containers.Map
-data_map = containers.Map(data_nums_sorted, values);
 %%
 [H, W, T] = size(adj_dFF_all);
-if further_smoothing
-    adj_dFF_all = imgaussfilt3(adj_dFF_all, [2, 2, 0.01]);
-end
 X_data = reshape(adj_dFF_all, [], size(adj_dFF_all, 3));
 clear adj_dFF_all
-
 
 %% Quality control to make sure there is no outliers
 frame_mean = mean(X_data, 1);
@@ -143,9 +96,6 @@ colormap(cmap)
 
 clim([min(evt_domain_projection_for_plot(isfinite(evt_domain_projection_for_plot))) max(evt_domain_projection_for_plot(isfinite(evt_domain_projection_for_plot)))])  % ignore NaNs for scaling
 colorbar
-%%
-% clear evt_all subs
-
 %% check the synchrony of signals from different locations in the FOV; The FOV is divided into 6 patches by geographical locations
 n_select = 2000; % choose number of pixels to average
 
@@ -221,17 +171,16 @@ set(gca,'XTick',1:6,'XTickLabel',labels)
 set(gca,'YTick',1:6,'YTickLabel',labels)
 
 title('Correlation between patch signals')
-clim([-1 1])
+clim([min(corr_matrix(:))-0.03, 1])
 colormap(parula)
+
 %%
 mask_all = mask_upper_half + mask_lower_half;
 [H, W] = size(mask_all);
 
-% Robust per-pixel noise variance via temporal differencing (MAD-based).
-noise_var = estimate_noise_var_per_pixel(X_data);   % (pixels x 1)
-
-% Reshape to image and apply mask (set masked pixels to NaN)
-noise_map = reshape(noise_var, H, W);
+% Per-pixel noise variance (precomputed from full-resolution data, then
+% divided by temp_down_factor to account for temporal averaging).
+noise_map = noise_var_ds;                          % H x W
 noise_map(mask_all == 0) = NaN;
 
 % visualize
@@ -240,20 +189,14 @@ figure;
 imagesc(noise_map);
 axis image;
 colorbar;
-title('Estimated Noise Variance Map');
+title('Estimated Noise Variance Map (from full-res, scaled to downsampled)');
 
 % Set NaNs (masked regions) to black
 colormap("hot");          % or any colormap you like
 set(gca, 'Color', 'k');    % background = black (for NaNs)
 
-%% The first principal component's time course has high correlation with the patches' spatial avg -> first PC's time course captures global activity
-% [coeff, score, latent] = pca(X_data(unmasked_indices, :)');
-% figure
-% plot(score(:,1))
-
-%% for NMF
-k_nmf_comp = 4; % number of components in NMF
-%% Constrained NMF
+%% for constrained NMF
+k_nmf_comp = 3; % number of components in NMF
 opts = struct();
 
 % =====================
@@ -309,7 +252,8 @@ opts.bg_profile_min_frames = 150;
 opts.bg_profile_smooth_sigma = 8;
 opts.bg_profile_shrink_uniform = 0.05;
 opts.bg_profile_n_alternations = 4;
-opts.bg_noise_var = noise_var; % use the precomputed pixel-wise noise variance map
+opts.bg_noise_var = noise_var_ds; % use the precomputed pixel-wise noise variance map
+opts.temporally_downsampled = true; % data was binned 10x; diff-based noise estimation invalid
 % =====================
 % Nonnegativity handling
 % =====================
@@ -343,96 +287,16 @@ opts.lambdaA_L1_max = 130;
 opts.stop_if_A_all_zero = true;
 opts.require_target_A_nnz_for_stop = true;
 opts.rollback_on_A_nnz_undershoot = true;
-%% train on a small portion of videos, to figure out the A matrix
-subset_cutting_points = cumsum(video_lengths);
-subset_cutting_points = [0; subset_cutting_points];
-
-% videos_train = [11 13 19 21 25 27 33 35 37]; % for uninjured, left stim
-% videos_train = [10 12 26 28 34 36 38 40]; % for uninjured, right stim
-videos_train = [1 3 9 11 17 19 27 29]; % for injured, left stim
-% videos_train = [2 4 10 12 18 20 28 30]; % for injured, right stim
-
-for ii = 1:length(videos_train)
-    videos_train(ii) = data_map(videos_train(ii));
-end
-videos_test = setdiff(1:length(video_lengths), videos_train);
-
-% now, videos_train and videos_test are the video indices in this set
-% starting from 1
-time_train = []; time_test = [];
-for ii = 1:length(videos_train)
-    v_idx = videos_train(ii);
-    start_idx = subset_cutting_points(v_idx)+1;
-    end_idx = subset_cutting_points(v_idx+1);
-    time_train = [time_train start_idx:end_idx];
-end
-for ii = 1:length(videos_test)
-    v_idx = videos_test(ii);
-    start_idx = subset_cutting_points(v_idx)+1;
-    end_idx = subset_cutting_points(v_idx+1);
-    time_test = [time_test start_idx:end_idx];
-end
-
 
 %%
-[A_upper, C_upper_train, info_upper_train] = custom_cnmf(X_data(:, time_train), H, W, k_nmf_comp, mask_upper_half, evt_domain_projection, opts);
-[A_lower, C_lower_train, info_lower_train] = custom_cnmf(X_data(:, time_train), H, W, k_nmf_comp, mask_lower_half, evt_domain_projection, opts);
-
-%% show the training outcome
-plot_nmf_components_with_ethogram([A_upper A_lower], [C_upper_train; C_lower_train], etho_mat_all(time_train, :), 40, H, W)
-plot_nmf_components_with_ethogram([info_upper_train.B info_lower_train.B], [info_upper_train.F; info_lower_train.F], etho_mat_all(time_train, :), 40, H, W)
-
-%%
-A_upper = single(A_upper);
-A_lower = single(A_lower);
-
-B_upper = info_upper_train.B;
-B_upper = single(B_upper);
-opts.F_quantile_ref = prctile(info_upper_train.F, opts.F_baseline_prctile, 2);
-
-[C_upper_test, F_upper_test, info_upper_test] = infer_CF_fixed_AB(X_data(:, time_test), A_upper, B_upper, H, W, mask_upper_half, opts);
-
-B_lower = info_lower_train.B;
-B_lower = single(B_lower);
-opts.F_quantile_ref = prctile(info_lower_train.F, opts.F_baseline_prctile, 2);
-[C_lower_test, F_lower_test, info_lower_test] = infer_CF_fixed_AB(X_data(:, time_test), A_lower, B_lower, H, W, mask_lower_half, opts);
-
+[A_upper, C_upper, info_upper] = custom_cnmf(X_data, H, W, k_nmf_comp, mask_upper_half, evt_domain_projection, opts);
+[A_lower, C_lower, info_lower] = custom_cnmf(X_data, H, W, k_nmf_comp, mask_lower_half, evt_domain_projection, opts);
 %%
 A = [A_upper A_lower];
-B = [B_upper B_lower];
-C_train = [C_upper_train; C_lower_train];
-C_test =  [C_upper_test; C_lower_test];
-C = zeros(2*k_nmf_comp, T);
-C(:, time_train) = C_train;
-C(:, time_test) = C_test;
+B = [info_upper.B info_lower.B];
+C = [C_upper; C_lower];
+plot_nmf_components_with_ethogram(A, C, etho_mat_all, 26.5/10, H, W);
 
-F_train = [info_upper_train.F; info_lower_train.F];
-F_test = [F_upper_test; F_lower_test];
-F = zeros(2*opts.bg_rank, T);
-F(:, time_train) = F_train;
-F(:, time_test) = F_test;
-
-norm(A(unmasked_indices, :) * C + B(unmasked_indices, :) * F - X_data(unmasked_indices, :), 'fro') / norm(X_data(unmasked_indices, :), 'fro')
-%% Shift the test baseline to match the train baseline, to mitigate potential batch effects
-opts_shift = struct();
-opts_shift.baseline_prctile = 10; % use the same percentile as the one used for background quiet percentile in CNMF
-opts_shift.shift_strength = 1;     % full shift
-opts_shift.nonneg_clip = true;   % ensure nonnegativity after shifting
-[shifted_C, info_shift] = shift_postsplit_baseline(C, time_train, time_test, opts_shift);
-C = shifted_C;
-[shifted_F, info_shift_F] = shift_postsplit_baseline(F, time_train, time_test, opts_shift);
-F = shifted_F;
-
-%% show all
-plot_nmf_components_with_ethogram(A, C, etho_mat_all, 40, H, W, time_train, time_test)
-%% keep the significant spatial footprints only and check the reconstruction
-selected_comps = [1 2 3];
-norm(A(unmasked_indices, selected_comps) * C(selected_comps, :) + B(unmasked_indices, :) * F - X_data(unmasked_indices, :), 'fro') ...
-    / norm(X_data(unmasked_indices, :), 'fro')
-
-%% save the result
-file_save = fullfile(preprocessed_storage_path, stim_side, "NMF_result.mat");
-save(file_save, "A", "B", "C", "F", "etho_mat_all", "H", "W");
 %% Plot the components, their time course, and the onset of behaviors
 function plot_nmf_components_with_ethogram(A, C, ethogram_matrix, fps, H, W, time_train, time_test)
 
@@ -588,8 +452,6 @@ for i = 1:k
 end
 
 end
-
-
 
 function region_pixels = sample_connected_region(patch_idx, mask_vec, H, W, n_select)
 
