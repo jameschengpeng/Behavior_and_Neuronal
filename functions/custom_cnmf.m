@@ -131,6 +131,8 @@ guide_map_2d = reshape(signal_var_full, H, W);   % H x W, noise-corrected signal
 Xr = max(Xr, 0);  % clipping to keep nonnegativity for NMF algorithm
 if opts.AC_init_method == "svd"
     [Aact, C, init_info] = init_AC_svd(Xr, K);
+elseif opts.AC_init_method == "random"
+    [Aact, C, init_info] = init_AC_random(Xr, K);
 else
     [Aact, C, init_info] = init_AC_from_guide_map(Xr, guide_map_2d, reshape(mask, H, W), K, opts);
 end
@@ -608,7 +610,7 @@ function opts = set_default_opts(opts)
     def.init_active_percentile = 25;
     def.init_evt_ridge = 1e-6;
     def.AC_init_mode = "event_projection";
-    def.AC_init_method = "guide_map";  % "guide_map" or "svd"
+    def.AC_init_method = "guide_map";  % "guide_map", "svd", or "random"
 
     def.etaA = 1e-3;
     def.etaC = 1e-3;
@@ -780,6 +782,19 @@ function [A, C, info] = init_AC_svd(Xr, K)
     C = cast(C, 'like', Xr);
     info.method = "svd";
     info.singular_values = diag(S);
+end
+
+%%
+function [A, C, info] = init_AC_random(Xr, K)
+%INIT_AC_RANDOM  Initialize A, C with uniform random values scaled to data.
+%  Xr: Pm x T (nonneg-clipped background residual)
+%  Returns A (Pm x K), C (K x T), both nonneg.
+    [Pm, T] = size(Xr);
+    scale = sqrt(mean(Xr(:).^2) / K + eps);   % match energy scale
+    A = scale * rand(Pm, K, 'like', Xr);
+    C = scale * rand(K, T, 'like', Xr);
+    info.method = "random";
+    info.scale = scale;
 end
 
 %% L2-normalization on the columns of A
