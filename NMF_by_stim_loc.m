@@ -259,8 +259,8 @@ opts = struct();
 % =====================
 % Iteration / stopping
 % =====================
-opts.maxIter   = 15;
-opts.minIter   = 5;
+opts.maxIter   = 25;
+opts.minIter   = 15;
 opts.tol       = 0.01;
 % =====================
 % Spatial penalties
@@ -334,8 +334,8 @@ opts.printEvery = 2;
 % Related to sparsity
 % =====================
 opts.adapt_lambdaA_L1 = true;
-opts.target_A_nnz_frac = 0.04;
-opts.target_A_nnz_tol = 0.01;
+opts.target_A_nnz_frac = 0.3; % default 0.04
+opts.target_A_nnz_tol = 0.5; % default 0.01
 opts.lambdaA_L1_adapt_rate = 8;
 opts.lambdaA_L1_min = 20;
 
@@ -348,7 +348,7 @@ opts.rollback_on_A_nnz_undershoot = true;
 % =====================
 % Related to initialization of A and C
 % =====================
-opts.AC_init_method = "svd"; % "svd" or "guide_map"
+opts.AC_init_method = "random"; % "svd" or "guide_map" or "random"
 %% train on a small portion of videos, to figure out the A matrix
 subset_cutting_points = cumsum(video_lengths);
 subset_cutting_points = [0; subset_cutting_points];
