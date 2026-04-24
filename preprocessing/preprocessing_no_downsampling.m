@@ -1,4 +1,4 @@
-%% 
+%% This is the preprocessing script for CCK neuronal data
 clear
 clc
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\scalable_calcium_model_prev'));
@@ -17,7 +17,7 @@ AQuA2_file_suffix = "ManualMoCo_cropped_AQuA2"; % for cck with or without injury
 AQuA2_result_path = "F:\CCK_PilotData_Baseline\AQuA2";
 condensed_ethogram_scoring_path = "F:\CCK_PilotData_Baseline\BaselineBehaviorScoring";
 preprocessed_storage_path = "F:\CCK_PilotData_Baseline\preprocessed_data";
-stim_scoring_filepath = [];
+stim_scoring_filepath = "F:\CCK_PilotData_Baseline\StimulusScoring.xlsx";
 
 %% 
 if ~isempty(stim_scoring_filepath)
