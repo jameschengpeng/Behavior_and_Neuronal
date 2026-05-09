@@ -16,13 +16,14 @@ function [noise_var_xt, qa] = estimate_noise_var_timecourse(X, mask, video_lengt
 %   qa           : compact quality-assurance struct with classification and
 %                  fit summaries.
 %
-% The function uses alpha = 0.05 and sigma_frames = 1. Pixels classified as
-% homoscedastic use the temporal-differencing MAD estimator. Pixels
-% classified as heteroscedastic use outputs from
-% test_temporal_heteroscedasticity_fast, then a shared slope with
-% pixel-specific intercepts to build a time-varying variance map. The
-% fitted squared-difference variance is divided by 2 to convert back to
-% noise-variance units.
+% The function uses sigma_frames = 1. Homoscedastic pixels use the
+% temporal-differencing MAD estimator. Heteroscedastic pixels are selected
+% with a pooled fixed-effect model on log squared differences that estimates
+% one shared signal-dependent slope across active pixels and pixel-specific
+% intercepts. A pixel uses the time-varying model only when it gives enough
+% per-pixel fit improvement and enough predicted noise dynamic range. The
+% final fitted squared-difference variance is divided by 2 to convert back
+% to noise-variance units.
 %
 % Boundary handling:
 %   - The first and last frames of each video are handled with replicate
@@ -30,8 +31,10 @@ function [noise_var_xt, qa] = estimate_noise_var_timecourse(X, mask, video_lengt
 %   - Temporal differences never cross video boundaries.
 %   - If video_lengths is omitted, the full trace is treated as one video.
 
-alpha = 0.05;
+alpha = NaN; % Legacy QA field; classification now uses practical thresholds.
 sigma_frames = 1;
+min_model_improvement = 0;
+min_noise_dynamic_range = 0.10;
 
 [n_pixels, T] = size(X);
 if numel(mask) ~= n_pixels
@@ -50,8 +53,11 @@ mask_vec = logical(mask(:));
 noise_var_xt = zeros(n_pixels, T, 'like', X);
 
 qa = struct();
+qa.classification_method = 'pooled_log_common_slope_with_pixel_intercepts';
 qa.alpha = alpha;
 qa.sigma_frames = sigma_frames;
+qa.min_model_improvement = min_model_improvement;
+qa.min_noise_dynamic_range = min_noise_dynamic_range;
 qa.mask = reshape(mask_vec, mask_size);
 qa.video_lengths = video_lengths;
 
@@ -63,8 +69,14 @@ if ~any(mask_vec)
     qa.pixel_intercept_map = nan(mask_size);
     qa.pixel_slope_map = nan(mask_size);
     qa.hetero_intercept_map = nan(mask_size);
+    qa.model_improvement_map = nan(mask_size);
+    qa.noise_dynamic_range_map = nan(mask_size);
+    qa.log_y_floor_map = nan(mask_size);
     qa.common_slope_noisevar = 0;
     qa.common_slope_diffvar = 0;
+    qa.common_slope_diffvar_raw = 0;
+    qa.common_slope_logdiffvar = 0;
+    qa.common_slope_logdiffvar_raw = 0;
     qa.common_vs_pixel_sse_ratio_median = NaN;
     qa.common_vs_pixel_sse_ratio_p95 = NaN;
     qa.n_heteroscedastic = 0;
@@ -74,110 +86,122 @@ if ~any(mask_vec)
 end
 
 active_idx = find(mask_vec);
-results = test_temporal_heteroscedasticity_fast(X, reshape(mask_vec, mask_size), alpha, sigma_frames, video_lengths);
 X_use = X(active_idx, :);
 [Xs_use, M_pair, Y_pair, valid_pair, video_lengths] = build_segmentwise_pair_features(X_use, sigma_frames, video_lengths);
 noise_var_const = estimate_noise_var_per_pixel_segmentwise(X_use, video_lengths);
 
-qval_full = results.qval_map(:);
-intercept_full = results.intercept_map(:);
-slope_full = results.slope_map(:);
-n_valid_full = results.n_valid_map(:);
-meanM_full = results.mean_level_map(:);
-meanY_full = results.mean_response_map(:);
-Sxx_full = results.level_ss_map(:);
-Sxy_full = results.level_response_cross_map(:);
+Y_floor_source = double(Y_pair);
+Y_floor_source(~valid_pair | ~isfinite(Y_floor_source) | (Y_floor_source <= 0)) = NaN;
+log_y_floor = prctile(Y_floor_source, 5, 2);
+log_y_floor(~isfinite(log_y_floor) | (log_y_floor <= 0)) = eps;
 
-sig_vec = logical(results.sig_fdr_map(:)) & mask_vec;
-homo_vec = mask_vec & ~sig_vec;
+Y_log_input = double(Y_pair);
+Y_log_input(~valid_pair | ~isfinite(Y_log_input) | (Y_log_input < 0)) = NaN;
+logY_pair = log(max(Y_log_input, log_y_floor));
+valid_log_pair = valid_pair & isfinite(M_pair) & isfinite(logY_pair);
 
-local_hetero = sig_vec(active_idx);
+M_work = double(M_pair);
+logY_work = logY_pair;
+M_work(~valid_log_pair) = 0;
+logY_work(~valid_log_pair) = 0;
+
+n_valid = sum(valid_log_pair, 2);
+n_safe = max(double(n_valid), 1);
+sumM = sum(M_work, 2);
+sumLogY = sum(logY_work, 2);
+sumM2 = sum(M_work .* M_work, 2);
+sumLogY2 = sum(logY_work .* logY_work, 2);
+sumMLogY = sum(M_work .* logY_work, 2);
+
+meanM = sumM ./ n_safe;
+meanLogY = sumLogY ./ n_safe;
+Sxx = sumM2 - (sumM .^ 2) ./ n_safe;
+Syy = sumLogY2 - (sumLogY .^ 2) ./ n_safe;
+Sxy = sumMLogY - (sumM .* sumLogY) ./ n_safe;
+Sxx = max(Sxx, 0);
+Syy = max(Syy, 0);
+
+valid_stats = (n_valid >= 3) & isfinite(Sxx) & isfinite(Sxy) & (Sxx > 0);
+denom = sum(Sxx(valid_stats));
+common_slope_logdiffvar_raw = 0;
+if denom > 0
+    common_slope_logdiffvar_raw = sum(Sxy(valid_stats)) / denom;
+end
+common_slope_logdiffvar = max(common_slope_logdiffvar_raw, 0);
+
+intercept_log_fit = meanLogY - common_slope_logdiffvar .* meanM;
+
+logYhat_common = intercept_log_fit + common_slope_logdiffvar .* double(M_pair);
+logYhat_common(~valid_log_pair) = 0;
+logY_res = logY_pair;
+logY_res(~valid_log_pair) = 0;
+res_common = logY_res - logYhat_common;
+res_common(~valid_log_pair) = 0;
+sse_common = sum(res_common .^ 2, 2);
+sse_const = Syy;
+model_improvement = 1 - (sse_common ./ max(sse_const, eps));
+model_improvement(~isfinite(model_improvement) | sse_const <= 0) = 0;
+
+M_min = double(M_pair);
+M_max = double(M_pair);
+M_min(~valid_log_pair) = Inf;
+M_max(~valid_log_pair) = -Inf;
+minM = min(M_min, [], 2);
+maxM = max(M_max, [], 2);
+signal_range = maxM - minM;
+signal_range(~isfinite(signal_range)) = 0;
+noise_dynamic_range = exp(common_slope_logdiffvar .* signal_range) - 1;
+noise_dynamic_range(~isfinite(noise_dynamic_range)) = 0;
+
+local_hetero = (common_slope_logdiffvar > 0) & valid_stats & ...
+    (model_improvement >= min_model_improvement) & ...
+    (noise_dynamic_range >= min_noise_dynamic_range);
 local_homo = ~local_hetero;
-beta0 = double(intercept_full(active_idx));
-beta1 = double(slope_full(active_idx));
-n_valid = double(n_valid_full(active_idx));
-meanM = double(meanM_full(active_idx));
-meanY = double(meanY_full(active_idx));
-Sxx = double(Sxx_full(active_idx));
-Sxy = double(Sxy_full(active_idx));
 
 noise_var_use = zeros(numel(active_idx), T, 'double');
-if any(local_homo)
-    noise_var_use(local_homo, :) = repmat(noise_var_const(local_homo), 1, T);
-end
+noise_var_use(:,:) = repmat(noise_var_const, 1, T);
 
 hetero_intercept_full = nan(n_pixels, 1);
 homo_noise_full = nan(n_pixels, 1);
 homo_noise_full(active_idx(local_homo)) = noise_var_const(local_homo);
-fitted_hetero = false(numel(active_idx), 1);
-
-common_slope_diffvar = 0;
-common_slope_noisevar = 0;
-ratio_median = NaN;
-ratio_p95 = NaN;
 n_negative_interval = 0;
 
 if any(local_hetero)
-    hetero_rows = find(local_hetero & (n_valid >= 3));
-    if ~isempty(hetero_rows)
-        valid_hetero = valid_pair(hetero_rows, :);
-        valid_stats = isfinite(Sxx(hetero_rows)) & isfinite(Sxy(hetero_rows));
-        denom = sum(Sxx(hetero_rows(valid_stats)));
-        if denom > 0
-            common_slope_diffvar = sum(Sxy(hetero_rows(valid_stats))) / denom;
-        end
+    hetero_rows = find(local_hetero);
+    valid_hetero = valid_log_pair(hetero_rows, :);
+    diffvar_anchor = max(2 .* double(noise_var_const(hetero_rows)), eps);
+    a_log = log(diffvar_anchor) - common_slope_logdiffvar .* meanM(hetero_rows);
 
-        b_pix = beta1;
-        a_common = meanY(hetero_rows) - common_slope_diffvar .* meanM(hetero_rows);
-        a_pix = beta0(hetero_rows);
+    interval_logdiffvar = a_log + common_slope_logdiffvar .* M_pair(hetero_rows, :);
+    interval_diffvar = exp(interval_logdiffvar);
+    interval_noisevar = interval_diffvar / 2;
 
-        interval_diffvar_raw = a_common + common_slope_diffvar .* M_pair(hetero_rows, :);
-        interval_diffvar = interval_diffvar_raw;
-        interval_diffvar = max(interval_diffvar, 0);
-        interval_noisevar = interval_diffvar / 2;
+    n_negative_interval = 0;
 
-        n_negative_interval = nnz((interval_diffvar_raw < 0) & valid_hetero);
+    frame_noisevar = interval_to_frame_noisevar(interval_noisevar, Xs_use(hetero_rows, :), a_log, common_slope_logdiffvar, video_lengths, true);
 
-        frame_noisevar = interval_to_frame_noisevar(interval_noisevar, Xs_use(hetero_rows, :), a_common, common_slope_diffvar, video_lengths);
-
-        noise_var_use(hetero_rows, :) = frame_noisevar;
-        fitted_hetero(hetero_rows) = true;
-        hetero_intercept_full(active_idx(hetero_rows)) = a_common / 2;
-
-        Yhat_common = a_common + common_slope_diffvar .* M_pair(hetero_rows, :);
-        Yhat_pix = a_pix + b_pix(hetero_rows) .* M_pair(hetero_rows, :);
-        Yhat_common(~valid_hetero) = 0;
-        Yhat_pix(~valid_hetero) = 0;
-
-        Y_res = Y_pair(hetero_rows, :);
-        Y_res(~valid_hetero) = 0;
-
-        res_common = Y_res - Yhat_common;
-        res_pix = Y_res - Yhat_pix;
-
-        sse_common = sum(res_common .^ 2, 2);
-        sse_pix = sum(res_pix .^ 2, 2);
-        ratio = sse_common ./ max(sse_pix, eps);
-        finite_ratio = ratio(isfinite(ratio));
-        if ~isempty(finite_ratio)
-            ratio_median = median(finite_ratio);
-            ratio_p95 = prctile(finite_ratio, 95);
-        end
-    end
-
-    remaining_hetero = local_hetero & ~fitted_hetero;
-    if any(remaining_hetero)
-        noise_var_use(remaining_hetero, :) = repmat(noise_var_const(remaining_hetero), 1, T);
-        homo_noise_full(active_idx(remaining_hetero)) = noise_var_const(remaining_hetero);
-        hetero_intercept_full(active_idx(remaining_hetero)) = NaN;
-        sig_vec(active_idx(remaining_hetero)) = false;
-        homo_vec(active_idx(remaining_hetero)) = true;
-    end
-
-    common_slope_noisevar = common_slope_diffvar / 2;
+    noise_var_use(hetero_rows, :) = frame_noisevar;
+    hetero_intercept_full(active_idx(hetero_rows)) = exp(a_log) / 2;
 end
 
 noise_var_xt(active_idx, :) = cast(noise_var_use, 'like', X);
+
+sig_vec = false(n_pixels, 1);
+sig_vec(active_idx(local_hetero)) = true;
+homo_vec = mask_vec & ~sig_vec;
+
+qval_full = nan(n_pixels, 1);
+intercept_full = nan(n_pixels, 1);
+slope_full = nan(n_pixels, 1);
+model_improvement_full = nan(n_pixels, 1);
+noise_dynamic_range_full = nan(n_pixels, 1);
+log_y_floor_full = nan(n_pixels, 1);
+diffvar_anchor_full = max(2 .* double(noise_var_const), eps);
+intercept_full(active_idx) = log(diffvar_anchor_full) - common_slope_logdiffvar .* meanM;
+slope_full(active_idx) = common_slope_logdiffvar;
+model_improvement_full(active_idx) = model_improvement;
+noise_dynamic_range_full(active_idx) = noise_dynamic_range;
+log_y_floor_full(active_idx) = log_y_floor;
 
 qa.homoscedastic_map = reshape(homo_vec, mask_size);
 qa.heteroscedastic_map = reshape(sig_vec, mask_size);
@@ -186,10 +210,16 @@ qa.homoscedastic_noise_var_map = reshape(fill_missing_with_zero(homo_noise_full)
 qa.pixel_intercept_map = reshape(intercept_full, mask_size);
 qa.pixel_slope_map = reshape(slope_full, mask_size);
 qa.hetero_intercept_map = reshape(hetero_intercept_full, mask_size);
-qa.common_slope_noisevar = common_slope_noisevar;
-qa.common_slope_diffvar = common_slope_diffvar;
-qa.common_vs_pixel_sse_ratio_median = ratio_median;
-qa.common_vs_pixel_sse_ratio_p95 = ratio_p95;
+qa.model_improvement_map = reshape(model_improvement_full, mask_size);
+qa.noise_dynamic_range_map = reshape(noise_dynamic_range_full, mask_size);
+qa.log_y_floor_map = reshape(log_y_floor_full, mask_size);
+qa.common_slope_noisevar = NaN;
+qa.common_slope_diffvar = NaN;
+qa.common_slope_diffvar_raw = NaN;
+qa.common_slope_logdiffvar = common_slope_logdiffvar;
+qa.common_slope_logdiffvar_raw = common_slope_logdiffvar_raw;
+qa.common_vs_pixel_sse_ratio_median = NaN;
+qa.common_vs_pixel_sse_ratio_p95 = NaN;
 qa.n_heteroscedastic = nnz(sig_vec);
 qa.n_homoscedastic = nnz(homo_vec);
 qa.n_negative_interval_predictions = n_negative_interval;
@@ -225,7 +255,11 @@ noise_var = (std_d .^ 2) / 2;
 noise_var(~isfinite(noise_var)) = 0;
 end
 
-function frame_noisevar = interval_to_frame_noisevar(interval_noisevar, Xs_rows, a_common, common_slope_diffvar, video_lengths)
+function frame_noisevar = interval_to_frame_noisevar(interval_noisevar, Xs_rows, intercept, slope, video_lengths, log_model)
+if nargin < 6
+    log_model = false;
+end
+
 [n_rows, T] = size(Xs_rows);
 frame_noisevar = zeros(n_rows, T);
 
@@ -235,7 +269,11 @@ for seg = 1:numel(video_lengths)
     end_idx = start_idx + seg_len - 1;
 
     if seg_len == 1
-        frame_noisevar(:, start_idx) = max(a_common + common_slope_diffvar .* Xs_rows(:, start_idx), 0) / 2;
+        if log_model
+            frame_noisevar(:, start_idx) = exp(intercept + slope .* Xs_rows(:, start_idx)) / 2;
+        else
+            frame_noisevar(:, start_idx) = max(intercept + slope .* Xs_rows(:, start_idx), 0) / 2;
+        end
     else
         pair_cols = start_idx:(end_idx - 1);
         frame_noisevar(:, start_idx) = interval_noisevar(:, pair_cols(1));

@@ -1,5 +1,7 @@
 function [noise_var_xt, qa_by_video] = estimate_noise_var_timecourse_by_video(X, mask, video_lengths)
 %ESTIMATE_NOISE_VAR_TIMECOURSE_BY_VIDEO Estimate pixel-time noise one video at a time.
+% This function relies on estimate_noise_var_timecourse, which deals with
+% each video one-by-one
 
 [n_pixels, T] = size(X);
 if numel(mask) ~= n_pixels

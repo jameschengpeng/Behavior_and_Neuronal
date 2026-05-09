@@ -4,13 +4,13 @@ addpath(genpath('C:\Users\james\CBIL\Astrocyte\scalable_calcium_model_prev'));
 addpath(genpath('C:\Users\james\CBIL\Astrocyte\Behavior_and_Neuronal'));
 
 %%
-% % For injured data
-% preprocessed_storage_path = "F:\Mouse_behavior_data\D21\preprocessed_data"; further_smoothing = false;
-% stim_scoring_filepath = "F:\Mouse_behavior_data\D21\StimulusScoring.xlsx";
+% For injured data
+preprocessed_storage_path = "F:\Mouse_behavior_data\D21\preprocessed_data"; further_smoothing = false;
+stim_scoring_filepath = "F:\Mouse_behavior_data\D21\StimulusScoring.xlsx";
 
-% For uninjured data
-preprocessed_storage_path = "F:\CCK_PilotData_Baseline\preprocessed_data"; further_smoothing = true;
-stim_scoring_filepath = "F:\CCK_PilotData_Baseline\StimulusScoring.xlsx";
+% % For uninjured data
+% preprocessed_storage_path = "F:\CCK_PilotData_Baseline\preprocessed_data"; further_smoothing = true;
+% stim_scoring_filepath = "F:\CCK_PilotData_Baseline\StimulusScoring.xlsx";
 
 stim_scoring_table = get_stim_metadata(stim_scoring_filepath);
 
@@ -21,8 +21,8 @@ combined_savefile = fullfile(preprocessed_storage_path, stim_side, "data_combine
 if exist(combined_savefile, 'file')==2
     combined_vars = who('-file', combined_savefile);
     load_vars = {'adj_dFF_all', 'evt_all', 'etho_mat_all', 'mask_upper_half', 'mask_lower_half', 'video_lengths'};
-    if any(strcmp(combined_vars, 'noise_var_xt'))
-        load_vars{end + 1} = 'noise_var_xt';
+    if any(strcmp(combined_vars, 'noise_model'))
+        load_vars{end + 1} = 'noise_model';
     end
 
     saved_data = load(combined_savefile, load_vars{:});
@@ -32,13 +32,13 @@ if exist(combined_savefile, 'file')==2
     mask_upper_half = saved_data.mask_upper_half;
     mask_lower_half = saved_data.mask_lower_half;
     video_lengths = saved_data.video_lengths;
-    if isfield(saved_data, 'noise_var_xt')
-        noise_var_xt = single(saved_data.noise_var_xt);
+    if isfield(saved_data, 'noise_model')
+        noise_model = saved_data.noise_model;
     else
         X_noise = reshape(adj_dFF_all, [], size(adj_dFF_all, 3));
         mask_all_noise = logical(mask_upper_half + mask_lower_half);
-        noise_var_xt = single(estimate_noise_var_timecourse_by_video(X_noise, mask_all_noise, video_lengths));
-        save(combined_savefile, 'noise_var_xt', '-append');
+        noise_model = estimate_noise_model_by_video(X_noise, mask_all_noise, video_lengths);
+        save(combined_savefile, 'noise_model', '-append');
         clear X_noise mask_all_noise
     end
     clear saved_data
@@ -46,17 +46,13 @@ else
     adj_dFF_all = [];
     evt_all = [];
     etho_mat_all = [];
-    noise_var_xt_all = [];
-    matFiles = dir(fullfile(preprocessed_storage_path, stim_side, "*.mat"));
+    noise_model_by_file = {};
+    matFiles = dir(fullfile(preprocessed_storage_path, stim_side, "data??.mat"));
     video_lengths = zeros(numel(matFiles), 1);
     for ii = 1:numel(matFiles)
         filename = matFiles(ii).name;
         filepath = fullfile(preprocessed_storage_path, stim_side, filename);
-        file_vars = who('-file', filepath);
         load_vars = {'datSmo', 'F0', 'evt_map', 'condensed_ethogram_mat', 'mask_upper_half', 'mask_lower_half'};
-        if any(strcmp(file_vars, 'noise_var_xt'))
-            load_vars{end + 1} = 'noise_var_xt';
-        end
 
         saved_data = load(filepath, load_vars{:});
         datSmo = saved_data.datSmo;
@@ -67,29 +63,26 @@ else
         mask_lower_half = saved_data.mask_lower_half;
 
         adj_dFF_this = single(datSmo ./ F0);
-        if isfield(saved_data, 'noise_var_xt')
-            noise_var_xt_this = single(saved_data.noise_var_xt);
-        else
-            mask_all_this = logical(mask_upper_half + mask_lower_half);
-            X_this = reshape(adj_dFF_this, [], size(adj_dFF_this, 3));
-            noise_var_xt_this = single(estimate_noise_var_timecourse_by_video(X_this, mask_all_this, size(adj_dFF_this, 3)));
-            noise_var_xt = noise_var_xt_this;
-            save(filepath, 'noise_var_xt', '-append');
-            clear noise_var_xt X_this mask_all_this
-        end
+        mask_all_this = logical(mask_upper_half + mask_lower_half);
+        X_this = reshape(adj_dFF_this, [], size(adj_dFF_this, 3));
+        noise_model_this = estimate_noise_model_by_video(X_this, mask_all_this, size(adj_dFF_this, 3));
+        clear X_this mask_all_this
         
         adj_dFF_all = cat(3, adj_dFF_all, adj_dFF_this); % F/F0 = 1+dF/F0, so it is adjusted dFF
         evt_all = cat(3, evt_all, evt_map);
         etho_mat_all = cat(1, etho_mat_all, condensed_ethogram_mat);
-        noise_var_xt_all = cat(2, noise_var_xt_all, noise_var_xt_this);
+        noise_model_by_file{ii, 1} = noise_model_this;
         video_lengths(ii) = size(datSmo, 3);
-        clear saved_data datSmo F0 evt_map condensed_ethogram_mat adj_dFF_this noise_var_xt_this
+        clear saved_data datSmo F0 evt_map condensed_ethogram_mat adj_dFF_this noise_model_this
         fprintf(strcat('Processed file ', filename, '\n'));
     end
-    noise_var_xt = noise_var_xt_all;
-    clear noise_var_xt_all
-    save(combined_savefile, "adj_dFF_all", "evt_all", "etho_mat_all", "mask_upper_half", "mask_lower_half", "video_lengths", "noise_var_xt", "-v7.3");
+    noise_model = concat_noise_models_by_video(noise_model_by_file);
+    save(combined_savefile, "adj_dFF_all", "evt_all", "etho_mat_all", "mask_upper_half", "mask_lower_half", "video_lengths", "noise_model", "-v7.3");
+    clear noise_model_by_file
 end
+
+noise_var_xt = restore_noise_var_xt_from_model(noise_model);
+
 
 %% video time indices, stimuli onset and offset time indices, grouped by stim_type
 stim_by_type_info = stim_times_by_side_and_type(stim_scoring_table, stim_side, video_lengths);
@@ -207,14 +200,13 @@ colormap(cmap)
 clim([min(evt_domain_projection_for_plot(isfinite(evt_domain_projection_for_plot))) max(evt_domain_projection_for_plot(isfinite(evt_domain_projection_for_plot)))])  % ignore NaNs for scaling
 colorbar
 %%
-clear evt_all subs grp
+clear evt_all subs grp pix_idx
 %%
 idx_upper = find(mask_upper_half(:));
 idx_lower = find(mask_lower_half(:));
 idx_all = find(mask_all(:));
 
-%%
-
+%% Simpler assumption: pixel noise has constant variance; Just have an understanding of noise variance, not exactly true
 % Robust per-pixel noise variance via temporal differencing (MAD-based).
 noise_var = estimate_noise_var_per_pixel(X_data);   % (pixels x 1)
 
@@ -222,67 +214,87 @@ noise_var = estimate_noise_var_per_pixel(X_data);   % (pixels x 1)
 noise_map = reshape(noise_var, H, W);
 noise_map(mask_all == 0) = NaN;
 
-% visualize
 figure;
 
 imagesc(noise_map);
 axis image;
-colorbar;
+
+cb = colorbar;
+cb.FontSize = 14;   % larger colorbar tick-label font
+cb.FontWeight = 'bold';
+
 title('Estimated Noise Variance Map');
 
 % Set NaNs (masked regions) to black
-colormap("hot");          % or any colormap you like
-set(gca, 'Color', 'k');    % background = black (for NaNs)
+colormap("parula");
+set(gca, 'Color', 'k');
+clim([quantile(noise_map(idx_all), 0.0), quantile(noise_map(idx_all), 0.999)])
 
-%% set opts.bg_noise_var only
+%% Get the guide_map_2d for each stimulus type, assuming constant noise variance for each pixel, just for demonstration
 opts = struct();
 opts.bg_noise_var = noise_var;
-%% for brush stimuli
+% for brush stimuli
 time_brush = cell2mat(stim_by_type_info.B.video_indices);
 guide_map_2d_brush = compute_guide_map_2d(X_data(:, time_brush), H, W, mask_all, opts);
-figure
-imagesc(guide_map_2d_brush)
-clim([quantile(guide_map_2d_brush(idx_all), 0.01), quantile(guide_map_2d_brush(idx_all), 0.99)])
-title("Active regions by pixel signal variance (Brush stim only)", 'FontSize', 14, 'FontWeight','bold')
-colorbar()
 
-%% for von Frey 5 stimuli
+% for von Frey 5 stimuli
 time_vF5 = cell2mat(stim_by_type_info.x5.video_indices);
 guide_map_2d_vF5 = compute_guide_map_2d(X_data(:, time_vF5), H, W, mask_all, opts);
-figure
-imagesc(guide_map_2d_vF5)
-clim([quantile(guide_map_2d_vF5(idx_all), 0.01), quantile(guide_map_2d_vF5(idx_all), 0.99)])
-title("Active regions by pixel signal variance (von Frey 5 stim only)", 'FontSize', 14, 'FontWeight','bold')
-colorbar()
 
-%% for von Frey 8 stimuli
+% for von Frey 8 stimuli
 time_vF8 = cell2mat(stim_by_type_info.x8.video_indices);
 guide_map_2d_vF8 = compute_guide_map_2d(X_data(:, time_vF8), H, W, mask_all, opts);
-figure
-imagesc(guide_map_2d_vF8)
-clim([quantile(guide_map_2d_vF8(idx_all), 0.01), quantile(guide_map_2d_vF8(idx_all), 0.99)])
-title("Active regions by pixel signal variance (von Frey 8 stim only)", 'FontSize', 14, 'FontWeight','bold')
-colorbar()
 
-%% for pin prick stimuli
+% for pin prick stimuli
 time_pp = cell2mat(stim_by_type_info.P.video_indices);
 guide_map_2d_pp = compute_guide_map_2d(X_data(:, time_pp), H, W, mask_all, opts);
-figure
+%% Visualize the guide_map_2d for each stimulus type
+guide_vals_all = [guide_map_2d_brush(idx_all); ...
+                  guide_map_2d_vF5(idx_all); ...
+                  guide_map_2d_vF8(idx_all); ...
+                  guide_map_2d_pp(idx_all)];
+guide_vals_all = guide_vals_all(isfinite(guide_vals_all));
+guide_clim = quantile(guide_vals_all, [0.01, 0.99]);
+
+figure('Color', 'w');
+
+ax1 = subplot(2,2,1);
+imagesc(guide_map_2d_brush)
+clim(ax1, guide_clim)
+axis(ax1, 'image')
+title("Active regions by pixel signal variance (Brush stim only)", 'FontSize', 14, 'FontWeight','bold')
+
+ax2 = subplot(2,2,2);
+imagesc(guide_map_2d_vF5)
+clim(ax2, guide_clim)
+axis(ax2, 'image')
+title("Active regions by pixel signal variance (von Frey 5 stim only)", 'FontSize', 14, 'FontWeight','bold')
+
+ax3 = subplot(2,2,3);
+imagesc(guide_map_2d_vF8)
+clim(ax3, guide_clim)
+axis(ax3, 'image')
+title("Active regions by pixel signal variance (von Frey 8 stim only)", 'FontSize', 14, 'FontWeight','bold')
+
+ax4 = subplot(2,2,4);
 imagesc(guide_map_2d_pp)
-clim([quantile(guide_map_2d_pp(idx_all), 0.01), quantile(guide_map_2d_pp(idx_all), 0.99)])
+clim(ax4, guide_clim)
+axis(ax4, 'image')
 title("Active regions by pixel signal variance (pin prick stim only)", 'FontSize', 14, 'FontWeight','bold')
-colorbar()
+
+cb = colorbar(ax4, 'eastoutside');
+cb.FontSize = 14;
+cb.FontWeight = 'bold';
+cb.Position = [0.92 0.11 0.02 0.815];
 
 %% Another exploration: does each pixel has heteroscedastic noise? i.e., noise variance is not constant given pixel p
-
 % time_selected = [time_brush(1:2000); time_vF8(1:2000); time_vF5(1:2000); time_pp(1:2000)];
 % X = X_data(:, time_selected);
 X = X_data;
 clear X_data
-results = test_temporal_heteroscedasticity_fast(X, mask_all, 0.05, 1);
+results = test_temporal_heteroscedasticity_fast(X, mask_all, 0.05, 2, video_lengths);
 
 %%
-
 mask2d = logical(results.mask);
 
 rho_map       = results.rho_map;
@@ -420,7 +432,7 @@ sample_Y = Y(sample_row, sample_valid);
 sample_fit_sorted = intercept_vec(sample_row) + slope_vec(sample_row) .* sample_M_sorted;
 sample_Y_sorted = sample_Y(order);
 
-% Figure
+%% Figure
 figure('Color', 'w', 'Position', [100 100 1600 900]);
 
 % 1) deltaVar map
@@ -451,11 +463,11 @@ set(ax3, 'Color', 'k');
 h3 = imagesc(logq_map);
 set(h3, 'AlphaData', isfinite(logq_map));
 axis image off;
-title('-log_{10}(q) map');
+title('-log_{10}(p-value) map');
 colormap(ax3, hot);
 cb3 = colorbar;
 caxis([0, logq_lim]);
-ylabel(cb3, '-log_{10}(q)');
+ylabel(cb3, '-log_{10}(p-value)');
 
 % 4) deltaVar histogram
 subplot(2,3,4);
@@ -501,32 +513,15 @@ fprintf('Median deltaVar over unmasked pixels: %.4g\n', median(deltaVar_valid, '
 fprintf('Median relative effect over unmasked pixels: %.4g\n', median(relEffect_valid, 'omitnan'));
 fprintf('Fraction FDR significant: %.4f\n', mean(sig_map(mask2d), 'omitnan'));
 
+clear ax1 ax2 ax3 ax6 h1 h2 h3 h6 cb1 cb2 cb3 cb6 bwr
+clear deltaVar_map relEffect_map meanY_map deltaM_map
+clear deltaVar_valid relEffect_valid q_valid logq_map
+clear intercept_vec sig_vec q_tmp sample_valid sample_M sample_Y
+clear sample_M_sorted sample_fit_sorted sample_Y_sorted sample_row
+clear X_use X1 X2 D rho_map intercept_map q_map sig_map
+
 
 %% Check whether 1 single slope and pixel-specific intercept sufficies
-mask = mask_all;
-maskv = logical(mask(:));
-idx = find(maskv);
-
-Xuse = X(idx,:);
-
-sigma_frames = results.sigma_frames;
-halfWidth = max(1, ceil(3*sigma_frames));
-tt = -halfWidth:halfWidth;
-g = exp(-(tt.^2)/(2*sigma_frames^2));
-g = g / sum(g);
-
-Xs = conv2(Xuse, g, 'same');
-
-X1 = Xuse(:,1:end-1);
-X2 = Xuse(:,2:end);
-M = 0.5 * (Xs(:,1:end-1) + Xs(:,2:end));
-Y = (X2 - X1).^2;
-
-valid = isfinite(M) & isfinite(Y);
-
-M(~valid) = 0;
-Y(~valid) = 0;
-
 n = sum(valid, 2);
 meanM = sum(M, 2) ./ max(n, 1);
 meanY = sum(Y, 2) ./ max(n, 1);
@@ -569,6 +564,32 @@ ratio = sse_common ./ max(sse_pix, eps);
 fprintf('Common slope = %.4g\n', b_common);
 fprintf('Median SSE ratio (common / pixel-specific) = %.4f\n', median(ratio, 'omitnan'));
 fprintf('95th percentile SSE ratio = %.4f\n', prctile(ratio(isfinite(ratio)), 95));
+
+%% Further check on intercept
+% Model A: common slope + pixel-specific intercepts
+% Model B: common slope + one common intercept
+
+a_one = sum(Y(:) - b_common .* M(:)) / sum(valid(:));   % one pooled intercept
+
+Yhat_one = a_one + b_common .* M;
+Yhat_one(~valid) = 0;
+
+res_one = Y - Yhat_one;
+res_one(~valid) = 0;
+
+sse_one = sum(res_one.^2, 2);
+
+ratio_AB = sse_one ./ max(sse_common, eps);
+
+fprintf('One-intercept model: a = %.6g\n', a_one);
+fprintf('Median SSE ratio (one intercept / pixel-specific intercepts) = %.4f\n', ...
+    median(ratio_AB, 'omitnan'));
+fprintf('95th percentile SSE ratio = %.4f\n', ...
+    prctile(ratio_AB(isfinite(ratio_AB)), 95));
+fprintf('Global SSE ratio = %.4f\n', ...
+    sum(sse_one, 'omitnan') / max(sum(sse_common, 'omitnan'), eps));
+
+%%
 
 
 
